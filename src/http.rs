@@ -67,6 +67,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Strips the optional `pubky` app-key prefix, leaving the bare z-base-32 key.
+fn normalized_z32(key: &str) -> &str {
+    key.strip_prefix("pubky").unwrap_or(key)
+}
+
 fn signature_string(headers: &HeaderMap) -> Result<String, ApiError> {
     headers
         .get(SIGNATURE_HEADER)
@@ -134,7 +139,9 @@ async fn create_invoice(
     }
     // v1 policy: the payment recipient is the lock creator. Locks enforces
     // this at lock creation; re-checked here as processor-drift defense.
-    if criterion.recipient_pubky != creator {
+    // Stored locks may carry the recipient as bare z32 while the addressed
+    // resource uses the pubky-prefixed app key, so compare normalized forms.
+    if normalized_z32(&criterion.recipient_pubky) != normalized_z32(creator) {
         return ApiError::InvalidRequest.into_response();
     }
     let amount_minor: i64 = match criterion.amount.parse::<i64>() {

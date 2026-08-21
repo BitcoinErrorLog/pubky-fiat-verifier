@@ -267,6 +267,16 @@ async fn harness_with_delay(settlement_delay: Duration) -> Harness {
             recipient_pubky: CREATOR.into(),
         },
     );
+    // Lock Server-stored locks carry the recipient as bare z32 (no `pubky`
+    // prefix), while the addressed resource uses the prefixed app key.
+    criteria.insert(
+        format!("{CREATOR}/pub/locks.app/usdbare.json"),
+        LockCriterion {
+            asset: "USD".into(),
+            amount: "1999".into(),
+            recipient_pubky: CREATOR.strip_prefix("pubky").unwrap().into(),
+        },
+    );
 
     let store: Arc<dyn CorrelationStore> = Arc::new(MemoryStore::default());
     let state = Arc::new(AppState {
@@ -454,6 +464,15 @@ async fn same_bundle_with_different_terms_conflicts() {
     }));
     let response = harness.signed_post("/invoices", &conflicting).await;
     assert_eq!(response.status().as_u16(), 409);
+}
+
+#[tokio::test]
+async fn bare_z32_recipient_matches_prefixed_creator() {
+    let harness = harness().await;
+    let response = harness.invoice("usdbare", BUNDLE).await;
+    assert_eq!(response.status().as_u16(), 204);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Created);
 }
 
 #[tokio::test]
