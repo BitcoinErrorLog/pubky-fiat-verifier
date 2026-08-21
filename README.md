@@ -114,11 +114,16 @@ All configuration is environment variables. No secret ever lives in this repo.
 
 ```bash
 railway add --service fiat-verifier            # once
-railway add --database postgres                # once (service "fiat-postgres")
-# set variables per the table above, then:
+railway add --database postgres                # once (deployed instance: "Postgres-sa-c")
+# set variables per the table above, plus PORT=3002 so Railway's healthcheck,
+# the public domain, and private networking all agree on the port; then:
 railway up --service fiat-verifier --detach
 railway domain --service fiat-verifier         # public domain (Stripe webhooks need one)
 ```
+
+Deployed staging values: public `https://fiat-verifier-production.up.railway.app`,
+private `http://fiat-verifier.railway.internal:3002`,
+`FIAT_DATABASE_URL=${{Postgres-sa-c.DATABASE_URL}}`.
 
 ### Enable Stripe test mode
 
