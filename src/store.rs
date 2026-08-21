@@ -1,0 +1,565 @@
+//! Correlation persistence. One row per (creator, bundle_id) — the invoice
+//! identity the Lock Server polls with. State transitions are monotonic:
+//! created -> paid -> confirmed, with reversed as a terminal branch reachable
+//! from created/paid (never from confirmed; a post-completion reversal is a
+//! marketplace dispute matter, not a Locks transition — design §5).
+
+use async_trait::async_trait;
+use time::OffsetDateTime;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorrelationState {
+    Created,
+    Paid,
+    Confirmed,
+    Reversed,
+}
+
+impl CorrelationState {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(Self::Created),
+            "paid" => Some(Self::Paid),
+            "confirmed" => Some(Self::Confirmed),
+            "reversed" => Some(Self::Reversed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Correlation {
+    pub creator: String,
+    pub bundle_id: String,
+    pub lock_resource: String,
+    pub reader: String,
+    pub asset: String,
+    pub amount_minor: i64,
+    pub state: CorrelationState,
+    pub session_id: Option<String>,
+    pub checkout_url: Option<String>,
+    pub checkout_expires_at: Option<i64>,
+    pub session_attempt: i32,
+    /// Populated on the first verified-paid pull; the reversal path resolves
+    /// charges back to correlations through it (SQL lookup in production).
+    #[allow(dead_code)]
+    pub payment_intent: Option<String>,
+    pub amount_matched: bool,
+    pub paid_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewCorrelation {
+    pub creator: String,
+    pub bundle_id: String,
+    pub lock_resource: String,
+    pub reader: String,
+    pub asset: String,
+    pub amount_minor: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    /// Same (creator, bundle_id) with identical lock_resource + reader:
+    /// idempotent replay, mirrors paykit-server's exact-replay acceptance.
+    ExactReplay,
+    /// Same identity bound to different terms: 409 upstream.
+    Conflict,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("correlation store error: {0}")]
+pub struct StoreError(pub String);
+
+#[async_trait]
+pub trait CorrelationStore: Send + Sync {
+    async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError>;
+    async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError>;
+    async fn set_session(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_id: &str,
+        checkout_url: &str,
+        checkout_expires_at: i64,
+        session_attempt: i32,
+    ) -> Result<(), StoreError>;
+    /// Records a verified-paid observation (from the API pull, never from a
+    /// webhook body). Forward-only: no-op unless current state is `created`.
+    async fn mark_paid(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        amount_matched: bool,
+        payment_intent: Option<&str>,
+        paid_at: OffsetDateTime,
+    ) -> Result<(), StoreError>;
+    /// Promotes paid -> confirmed. No-op unless current state is `paid`.
+    async fn mark_confirmed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        confirmed_at: OffsetDateTime,
+    ) -> Result<(), StoreError>;
+    /// Marks created/paid -> reversed (verified reversal). Never touches
+    /// `confirmed` rows.
+    async fn mark_reversed(&self, creator: &str, bundle_id: &str) -> Result<(), StoreError>;
+    async fn find_by_payment_intent(
+        &self,
+        payment_intent: &str,
+    ) -> Result<Option<Correlation>, StoreError>;
+    /// Returns true when the event id was new (i.e. should be processed).
+    async fn record_webhook_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<bool, StoreError>;
+    /// Fiat correlations with a session that still need observation
+    /// (state `created` or `paid`), for the slow-poll worker.
+    async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError>;
+    async fn healthy(&self) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// Postgres implementation
+// ---------------------------------------------------------------------------
+
+pub struct PostgresStore {
+    pool: sqlx::PgPool,
+}
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS correlations (
+    creator TEXT NOT NULL,
+    bundle_id TEXT NOT NULL,
+    lock_resource TEXT NOT NULL,
+    reader TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    amount_minor BIGINT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'created',
+    session_id TEXT,
+    checkout_url TEXT,
+    checkout_expires_at BIGINT,
+    session_attempt INTEGER NOT NULL DEFAULT 0,
+    payment_intent TEXT,
+    amount_matched BOOLEAN NOT NULL DEFAULT FALSE,
+    paid_at TIMESTAMPTZ,
+    confirmed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (creator, bundle_id)
+);
+CREATE INDEX IF NOT EXISTS correlations_payment_intent_idx
+    ON correlations (payment_intent) WHERE payment_intent IS NOT NULL;
+CREATE INDEX IF NOT EXISTS correlations_open_idx
+    ON correlations (state) WHERE state IN ('created', 'paid');
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"#;
+
+impl PostgresStore {
+    pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect(database_url)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        sqlx::raw_sql(SCHEMA)
+            .execute(&pool)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        Ok(Self { pool })
+    }
+}
+
+fn row_to_correlation(row: sqlx::postgres::PgRow) -> Result<Correlation, StoreError> {
+    use sqlx::Row;
+    let state: String = row.try_get("state").map_err(db_err)?;
+    Ok(Correlation {
+        creator: row.try_get("creator").map_err(db_err)?,
+        bundle_id: row.try_get("bundle_id").map_err(db_err)?,
+        lock_resource: row.try_get("lock_resource").map_err(db_err)?,
+        reader: row.try_get("reader").map_err(db_err)?,
+        asset: row.try_get("asset").map_err(db_err)?,
+        amount_minor: row.try_get("amount_minor").map_err(db_err)?,
+        state: CorrelationState::parse(&state)
+            .ok_or_else(|| StoreError(format!("unknown state '{state}'")))?,
+        session_id: row.try_get("session_id").map_err(db_err)?,
+        checkout_url: row.try_get("checkout_url").map_err(db_err)?,
+        checkout_expires_at: row.try_get("checkout_expires_at").map_err(db_err)?,
+        session_attempt: row.try_get("session_attempt").map_err(db_err)?,
+        payment_intent: row.try_get("payment_intent").map_err(db_err)?,
+        amount_matched: row.try_get("amount_matched").map_err(db_err)?,
+        paid_at: row.try_get("paid_at").map_err(db_err)?,
+    })
+}
+
+fn db_err(error: sqlx::Error) -> StoreError {
+    StoreError(error.to_string())
+}
+
+const SELECT_COLUMNS: &str = "creator, bundle_id, lock_resource, reader, asset, amount_minor, \
+     state, session_id, checkout_url, checkout_expires_at, session_attempt, payment_intent, \
+     amount_matched, paid_at";
+
+#[async_trait]
+impl CorrelationStore for PostgresStore {
+    async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO correlations (creator, bundle_id, lock_resource, reader, asset, amount_minor) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (creator, bundle_id) DO NOTHING",
+        )
+        .bind(&new.creator)
+        .bind(&new.bundle_id)
+        .bind(&new.lock_resource)
+        .bind(&new.reader)
+        .bind(&new.asset)
+        .bind(new.amount_minor)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if inserted.rows_affected() == 1 {
+            return Ok(InsertOutcome::Inserted);
+        }
+        let existing = self
+            .get(&new.creator, &new.bundle_id)
+            .await?
+            .ok_or_else(|| StoreError("conflicting row vanished".to_owned()))?;
+        if existing.lock_resource == new.lock_resource
+            && existing.reader == new.reader
+            && existing.asset == new.asset
+            && existing.amount_minor == new.amount_minor
+        {
+            Ok(InsertOutcome::ExactReplay)
+        } else {
+            Ok(InsertOutcome::Conflict)
+        }
+    }
+
+    async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM correlations WHERE creator = $1 AND bundle_id = $2"
+        ))
+        .bind(creator)
+        .bind(bundle_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(row_to_correlation).transpose()
+    }
+
+    async fn set_session(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        session_id: &str,
+        checkout_url: &str,
+        checkout_expires_at: i64,
+        session_attempt: i32,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE correlations SET session_id = $3, checkout_url = $4, \
+             checkout_expires_at = $5, session_attempt = $6, updated_at = now() \
+             WHERE creator = $1 AND bundle_id = $2",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(session_id)
+        .bind(checkout_url)
+        .bind(checkout_expires_at)
+        .bind(session_attempt)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn mark_paid(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        amount_matched: bool,
+        payment_intent: Option<&str>,
+        paid_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE correlations SET state = 'paid', amount_matched = $3, \
+             payment_intent = COALESCE($4, payment_intent), paid_at = $5, updated_at = now() \
+             WHERE creator = $1 AND bundle_id = $2 AND state = 'created'",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(amount_matched)
+        .bind(payment_intent)
+        .bind(paid_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn mark_confirmed(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+        confirmed_at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE correlations SET state = 'confirmed', confirmed_at = $3, updated_at = now() \
+             WHERE creator = $1 AND bundle_id = $2 AND state = 'paid'",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(confirmed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn mark_reversed(&self, creator: &str, bundle_id: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE correlations SET state = 'reversed', updated_at = now() \
+             WHERE creator = $1 AND bundle_id = $2 AND state IN ('created', 'paid')",
+        )
+        .bind(creator)
+        .bind(bundle_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn find_by_payment_intent(
+        &self,
+        payment_intent: &str,
+    ) -> Result<Option<Correlation>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM correlations WHERE payment_intent = $1 LIMIT 1"
+        ))
+        .bind(payment_intent)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(row_to_correlation).transpose()
+    }
+
+    async fn record_webhook_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<bool, StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO webhook_events (event_id, event_type) VALUES ($1, $2) \
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(event_id)
+        .bind(event_type)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(inserted.rows_affected() == 1)
+    }
+
+    async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM correlations \
+             WHERE state IN ('created', 'paid') AND session_id IS NOT NULL \
+             ORDER BY created_at ASC LIMIT 200"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(row_to_correlation).collect()
+    }
+
+    async fn healthy(&self) -> bool {
+        sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-memory implementation (unit tests)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub mod memory {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    pub struct MemoryStore {
+        rows: Mutex<HashMap<(String, String), Correlation>>,
+        events: Mutex<HashSet<String>>,
+    }
+
+    #[async_trait]
+    impl CorrelationStore for MemoryStore {
+        async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError> {
+            let mut rows = self.rows.lock().unwrap();
+            let key = (new.creator.clone(), new.bundle_id.clone());
+            if let Some(existing) = rows.get(&key) {
+                return Ok(
+                    if existing.lock_resource == new.lock_resource
+                        && existing.reader == new.reader
+                        && existing.asset == new.asset
+                        && existing.amount_minor == new.amount_minor
+                    {
+                        InsertOutcome::ExactReplay
+                    } else {
+                        InsertOutcome::Conflict
+                    },
+                );
+            }
+            rows.insert(
+                key,
+                Correlation {
+                    creator: new.creator,
+                    bundle_id: new.bundle_id,
+                    lock_resource: new.lock_resource,
+                    reader: new.reader,
+                    asset: new.asset,
+                    amount_minor: new.amount_minor,
+                    state: CorrelationState::Created,
+                    session_id: None,
+                    checkout_url: None,
+                    checkout_expires_at: None,
+                    session_attempt: 0,
+                    payment_intent: None,
+                    amount_matched: false,
+                    paid_at: None,
+                },
+            );
+            Ok(InsertOutcome::Inserted)
+        }
+
+        async fn get(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+        ) -> Result<Option<Correlation>, StoreError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(creator.to_owned(), bundle_id.to_owned()))
+                .cloned())
+        }
+
+        async fn set_session(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            session_id: &str,
+            checkout_url: &str,
+            checkout_expires_at: i64,
+            session_attempt: i32,
+        ) -> Result<(), StoreError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+                row.session_id = Some(session_id.to_owned());
+                row.checkout_url = Some(checkout_url.to_owned());
+                row.checkout_expires_at = Some(checkout_expires_at);
+                row.session_attempt = session_attempt;
+            }
+            Ok(())
+        }
+
+        async fn mark_paid(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            amount_matched: bool,
+            payment_intent: Option<&str>,
+            paid_at: OffsetDateTime,
+        ) -> Result<(), StoreError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+                if row.state == CorrelationState::Created {
+                    row.state = CorrelationState::Paid;
+                    row.amount_matched = amount_matched;
+                    if let Some(pi) = payment_intent {
+                        row.payment_intent = Some(pi.to_owned());
+                    }
+                    row.paid_at = Some(paid_at);
+                }
+            }
+            Ok(())
+        }
+
+        async fn mark_confirmed(
+            &self,
+            creator: &str,
+            bundle_id: &str,
+            _confirmed_at: OffsetDateTime,
+        ) -> Result<(), StoreError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+                if row.state == CorrelationState::Paid {
+                    row.state = CorrelationState::Confirmed;
+                }
+            }
+            Ok(())
+        }
+
+        async fn mark_reversed(&self, creator: &str, bundle_id: &str) -> Result<(), StoreError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+                if matches!(
+                    row.state,
+                    CorrelationState::Created | CorrelationState::Paid
+                ) {
+                    row.state = CorrelationState::Reversed;
+                }
+            }
+            Ok(())
+        }
+
+        async fn find_by_payment_intent(
+            &self,
+            payment_intent: &str,
+        ) -> Result<Option<Correlation>, StoreError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .find(|row| row.payment_intent.as_deref() == Some(payment_intent))
+                .cloned())
+        }
+
+        async fn record_webhook_event(
+            &self,
+            event_id: &str,
+            _event_type: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(self.events.lock().unwrap().insert(event_id.to_owned()))
+        }
+
+        async fn open_fiat_correlations(&self) -> Result<Vec<Correlation>, StoreError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|row| {
+                    matches!(
+                        row.state,
+                        CorrelationState::Created | CorrelationState::Paid
+                    ) && row.session_id.is_some()
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn healthy(&self) -> bool {
+            true
+        }
+    }
+}
