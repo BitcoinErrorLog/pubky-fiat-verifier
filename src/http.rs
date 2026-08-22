@@ -6,8 +6,9 @@
 //!
 //! Gateway-native surface:
 //!   POST /checkout-sessions     — buyer fetches the hosted checkout URL
+//!                                 (and picks the processor when unbound)
 //!   POST /webhooks/stripe       — processor hints (verified, deduped, then
-//!                                 superseded by an API pull)
+//!   POST /webhooks/paypal         superseded by an API pull)
 //!   GET  /health
 
 use std::sync::Arc;
@@ -26,12 +27,17 @@ use time::OffsetDateTime;
 use crate::auth::{parse_canonical_strict, verify_signature, SIGNATURE_HEADER};
 use crate::error::ApiError;
 use crate::lock_fetch::{CriterionSource, LockFetchError};
+use crate::paypal::WebhookHeaders;
 use crate::proxy::PaykitProxy;
 use crate::rate_limit::TokenBucket;
 use crate::state::{report, Report};
-use crate::store::{CorrelationState, CorrelationStore, InsertOutcome, NewCorrelation};
+use crate::store::{
+    Correlation, CorrelationState, CorrelationStore, InsertOutcome, NewCorrelation,
+};
 use crate::stripe::{client_reference, idempotency_key, StripeProcessor};
-use crate::verification::{promote_if_still_paid, pull_and_apply};
+use crate::verification::{
+    bound_processor, promote_if_still_paid, pull_and_apply, ProcessorKind, Processors,
+};
 use crate::wire::{
     parse_lock_resource, validate_id, CheckoutSessionRequest, CheckoutSessionResponse,
     InvoiceRequest, StatusRequest,
@@ -41,11 +47,18 @@ const MAX_BODY_BYTES: usize = 65_536;
 const WEBHOOK_TOLERANCE: Duration = Duration::from_secs(300);
 /// A checkout session this close to expiry is replaced rather than returned.
 const SESSION_EXPIRY_SLACK_SECONDS: i64 = 60;
+/// PayPal's create-order response carries no expiry; orders are approvable
+/// for roughly three hours, so the recorded expiry mirrors that default.
+const PAYPAL_ORDER_TTL_SECONDS: i64 = 3 * 3600;
 
 pub struct AppState {
     pub trusted_key: VerifyingKey,
     pub store: Arc<dyn CorrelationStore>,
-    pub stripe: Option<Arc<StripeProcessor>>,
+    pub processors: Arc<Processors>,
+    /// Effective default for unbound checkout requests naming no processor:
+    /// the sole configured processor, or `FIAT_DEFAULT_PROCESSOR` when both
+    /// are configured.
+    pub default_processor: ProcessorKind,
     pub criterion_source: Arc<dyn CriterionSource>,
     pub proxy: Arc<PaykitProxy>,
     pub settlement_delay: Duration,
@@ -62,6 +75,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/transactions/status", post(transaction_status))
         .route("/checkout-sessions", post(checkout_session))
         .route("/webhooks/stripe", post(stripe_webhook))
+        .route("/webhooks/paypal", post(paypal_webhook))
         .route("/health", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -148,13 +162,17 @@ async fn create_invoice(
         Ok(amount) if amount > 0 => amount,
         _ => return ApiError::InvalidRequest.into_response(),
     };
-    let Some(stripe) = state.stripe.as_ref() else {
+    if !state.processors.any_configured() {
         tracing::error!(
             bundle_id = %request.bundle_id,
-            "fiat invoice refused: no Stripe processor configured (fail-closed)"
+            "fiat invoice refused: no processor configured (fail-closed)"
         );
         return ApiError::Unavailable.into_response();
-    };
+    }
+    // Eager invoice-time minting only when the processor choice is forced
+    // (exactly one configured). With both configured the mint waits for the
+    // buyer's /checkout-sessions call, which carries the processor choice.
+    let eager = state.processors.sole_configured();
 
     let outcome = match state
         .store
@@ -189,6 +207,9 @@ async fn create_invoice(
                 Ok(Some(existing)) => existing,
                 _ => return ApiError::Unavailable.into_response(),
             };
+            let Some(kind) = eager else {
+                return StatusCode::NO_CONTENT.into_response();
+            };
             if existing.session_id.is_some() {
                 return StatusCode::NO_CONTENT.into_response();
             }
@@ -196,7 +217,7 @@ async fn create_invoice(
             // existed: idempotently create it now.
             match mint_session(
                 &state,
-                stripe,
+                kind,
                 creator,
                 &request.bundle_id,
                 &criterion.asset,
@@ -210,9 +231,19 @@ async fn create_invoice(
             }
         }
         InsertOutcome::Inserted => {
+            let Some(kind) = eager else {
+                tracing::info!(
+                    creator,
+                    bundle_id = %request.bundle_id,
+                    asset = %criterion.asset,
+                    amount_minor,
+                    "fiat invoice created; session mint deferred to checkout (both processors configured)"
+                );
+                return StatusCode::NO_CONTENT.into_response();
+            };
             match mint_session(
                 &state,
-                stripe,
+                kind,
                 creator,
                 &request.bundle_id,
                 &criterion.asset,
@@ -227,6 +258,7 @@ async fn create_invoice(
                         bundle_id = %request.bundle_id,
                         asset = %criterion.asset,
                         amount_minor,
+                        processor = kind.as_str(),
                         "fiat invoice created with checkout session"
                     );
                     StatusCode::NO_CONTENT.into_response()
@@ -238,6 +270,80 @@ async fn create_invoice(
 }
 
 async fn mint_session(
+    state: &Arc<AppState>,
+    kind: ProcessorKind,
+    creator: &str,
+    bundle_id: &str,
+    asset: &str,
+    amount_minor: i64,
+    attempt: i32,
+) -> Result<CheckoutSessionResponse, Response> {
+    match kind {
+        ProcessorKind::Stripe => {
+            let Some(stripe) = state.processors.stripe.as_ref() else {
+                return Err(ApiError::Unavailable.into_response());
+            };
+            mint_stripe_session(
+                state,
+                stripe,
+                creator,
+                bundle_id,
+                asset,
+                amount_minor,
+                attempt,
+            )
+            .await
+        }
+        ProcessorKind::Paypal => {
+            let Some(paypal) = state.processors.paypal.as_ref() else {
+                return Err(ApiError::Unavailable.into_response());
+            };
+            let order = paypal
+                .create_order(
+                    &client_reference(creator, bundle_id),
+                    &idempotency_key(creator, bundle_id, attempt),
+                    amount_minor,
+                    asset,
+                    "Marketplace listing (Locks entitlement)",
+                    &state.checkout_success_url,
+                    &state.checkout_cancel_url,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, creator, bundle_id, "paypal order creation failed");
+                    ApiError::Unavailable.into_response()
+                })?;
+            let approval_url = order.approval_url().map(str::to_owned).ok_or_else(|| {
+                tracing::error!(order_id = %order.id, "created paypal order has no approval link");
+                ApiError::Unavailable.into_response()
+            })?;
+            let expires_at = OffsetDateTime::now_utc().unix_timestamp() + PAYPAL_ORDER_TTL_SECONDS;
+            state
+                .store
+                .set_session(
+                    creator,
+                    bundle_id,
+                    ProcessorKind::Paypal.as_str(),
+                    &order.id,
+                    &approval_url,
+                    expires_at,
+                    attempt,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to persist paypal order");
+                    ApiError::Unavailable.into_response()
+                })?;
+            Ok(CheckoutSessionResponse {
+                checkout_url: approval_url,
+                processor: ProcessorKind::Paypal.as_str(),
+                expires_at,
+            })
+        }
+    }
+}
+
+async fn mint_stripe_session(
     state: &Arc<AppState>,
     stripe: &Arc<StripeProcessor>,
     creator: &str,
@@ -271,6 +377,7 @@ async fn mint_session(
         .set_session(
             creator,
             bundle_id,
+            ProcessorKind::Stripe.as_str(),
             &session.id,
             &checkout_url,
             expires_at,
@@ -283,7 +390,7 @@ async fn mint_session(
         })?;
     Ok(CheckoutSessionResponse {
         checkout_url,
-        processor: "stripe",
+        processor: ProcessorKind::Stripe.as_str(),
         expires_at,
     })
 }
@@ -347,14 +454,10 @@ async fn transaction_status(
     // fiat detection does not depend on webhook delivery at all.
     let correlation =
         if correlation.state == CorrelationState::Created && correlation.session_id.is_some() {
-            if let Some(stripe) = state.stripe.as_ref() {
-                pull_and_apply(&state.store, stripe, &correlation, now).await;
-                match state.store.get(&request.creator, &request.bundle_id).await {
-                    Ok(Some(refreshed)) => refreshed,
-                    _ => correlation,
-                }
-            } else {
-                correlation
+            pull_and_apply(&state.store, &state.processors, &correlation, now).await;
+            match state.store.get(&request.creator, &request.bundle_id).await {
+                Ok(Some(refreshed)) => refreshed,
+                _ => correlation,
             }
         } else {
             correlation
@@ -367,20 +470,17 @@ async fn transaction_status(
         state.synthesized_confirmations,
     ) {
         Report::Immediate(status) => status,
-        Report::PromotionDue { fallback } => match state.stripe.as_ref() {
-            Some(stripe) => {
-                if promote_if_still_paid(&state.store, stripe, &correlation, now).await {
-                    crate::wire::TransactionStatus {
-                        status: crate::wire::StatusKind::Confirmed,
-                        confirmations: state.synthesized_confirmations,
-                        amount_matched: true,
-                    }
-                } else {
-                    fallback
+        Report::PromotionDue { fallback } => {
+            if promote_if_still_paid(&state.store, &state.processors, &correlation, now).await {
+                crate::wire::TransactionStatus {
+                    status: crate::wire::StatusKind::Confirmed,
+                    confirmations: state.synthesized_confirmations,
+                    amount_matched: true,
                 }
+            } else {
+                fallback
             }
-            None => fallback,
-        },
+        }
     };
     Json(status).into_response()
 }
@@ -398,9 +498,16 @@ async fn checkout_session(
     if validate_id(&request.bundle_id).is_err() || request.creator.is_empty() {
         return ApiError::InvalidRequest.into_response();
     }
-    let Some(stripe) = state.stripe.as_ref() else {
-        return ApiError::Unavailable.into_response();
+    let requested = match request.processor.as_deref() {
+        None => None,
+        Some(value) => match ProcessorKind::parse(value) {
+            Some(kind) => Some(kind),
+            None => return ApiError::InvalidRequest.into_response(),
+        },
     };
+    if !state.processors.any_configured() {
+        return ApiError::Unavailable.into_response();
+    }
     let correlation = match state.store.get(&request.creator, &request.bundle_id).await {
         Ok(Some(correlation)) if correlation.asset != "BTC" => correlation,
         Ok(_) => return ApiError::NotFound.into_response(),
@@ -416,23 +523,38 @@ async fn checkout_session(
         return ApiError::InvoiceConflict.into_response();
     }
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-    if let (Some(url), Some(expires_at)) = (
-        correlation.checkout_url.clone(),
-        correlation.checkout_expires_at,
-    ) {
-        if expires_at > now_unix + SESSION_EXPIRY_SLACK_SECONDS {
-            return Json(CheckoutSessionResponse {
-                checkout_url: url,
-                processor: "stripe",
-                expires_at,
-            })
-            .into_response();
+    let kind = match bound_processor(&correlation) {
+        Some(bound) => {
+            // The binding is permanent: switching processors could leave a
+            // still-payable session on the abandoned processor — a payment
+            // this gateway would no longer observe (fail-closed).
+            if requested.is_some_and(|requested| requested != bound) {
+                return ApiError::InvoiceConflict.into_response();
+            }
+            if let (Some(url), Some(expires_at)) = (
+                correlation.checkout_url.clone(),
+                correlation.checkout_expires_at,
+            ) {
+                if expires_at > now_unix + SESSION_EXPIRY_SLACK_SECONDS {
+                    return Json(CheckoutSessionResponse {
+                        checkout_url: url,
+                        processor: bound.as_str(),
+                        expires_at,
+                    })
+                    .into_response();
+                }
+            }
+            bound
         }
+        None => requested.unwrap_or(state.default_processor),
+    };
+    if !state.processors.is_configured(kind) {
+        return ApiError::Unavailable.into_response();
     }
-    // Session expired (or was never fully persisted): mint a replacement.
+    // Session expired (or was never minted / never fully persisted): mint.
     match mint_session(
         &state,
-        stripe,
+        kind,
         &request.creator,
         &request.bundle_id,
         &correlation.asset,
@@ -451,7 +573,7 @@ async fn stripe_webhook(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
-    let Some(stripe) = state.stripe.as_ref() else {
+    let Some(stripe) = state.processors.stripe.as_ref() else {
         return ApiError::Unavailable.into_response();
     };
     let Some(webhook_secret) = stripe.webhook_secret.as_deref() else {
@@ -514,7 +636,7 @@ async fn stripe_webhook(
             match state.store.get(creator, bundle_id).await {
                 Ok(Some(correlation)) => {
                     // The webhook body is a hint. The pull is the fact.
-                    pull_and_apply(&state.store, stripe, &correlation, now).await;
+                    pull_and_apply(&state.store, &state.processors, &correlation, now).await;
                 }
                 Ok(None) => {
                     tracing::warn!(event_id, reference, "webhook for unknown correlation");
@@ -568,16 +690,254 @@ async fn stripe_webhook(
     Json(json!({"received": true})).into_response()
 }
 
+/// Capture statuses that corroborate a reversal webhook.
+fn is_reversal_capture_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("REFUNDED" | "PARTIALLY_REFUNDED" | "REVERSED" | "DECLINED" | "FAILED")
+    )
+}
+
+/// Extracts the capture id a reversal event refers to: the `up` link when
+/// the resource is a refund, or the resource's own id when it is a capture.
+fn reversal_capture_id(resource: &Value) -> Option<String> {
+    if let Some(links) = resource.get("links").and_then(Value::as_array) {
+        for link in links {
+            if link.get("rel").and_then(Value::as_str) == Some("up") {
+                if let Some(href) = link.get("href").and_then(Value::as_str) {
+                    if let Some((_, id)) = href.rsplit_once("/captures/") {
+                        if !id.is_empty() {
+                            return Some(id.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    resource
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Marks the correlation behind a verified-reversed PayPal capture, resolving
+/// it by the capture's `custom_id` reference with the persisted payment
+/// reference (capture id) as fallback.
+async fn mark_paypal_capture_reversed(
+    state: &Arc<AppState>,
+    capture_id: &str,
+    custom_id: Option<&str>,
+) {
+    let correlation: Option<Correlation> = match custom_id.and_then(|id| id.split_once('_')) {
+        Some((creator, bundle_id)) => match state.store.get(creator, bundle_id).await {
+            Ok(correlation) => correlation,
+            Err(error) => {
+                tracing::error!(%error, "lookup failed");
+                return;
+            }
+        },
+        None => match state.store.find_by_payment_intent(capture_id).await {
+            Ok(correlation) => correlation,
+            Err(error) => {
+                tracing::error!(%error, "lookup failed");
+                return;
+            }
+        },
+    };
+    match correlation {
+        Some(correlation) => {
+            if let Err(error) = state
+                .store
+                .mark_reversed(&correlation.creator, &correlation.bundle_id)
+                .await
+            {
+                tracing::error!(%error, "failed to persist reversal");
+            } else {
+                tracing::warn!(
+                    creator = %correlation.creator,
+                    bundle_id = %correlation.bundle_id,
+                    capture_id,
+                    "verified paypal reversal recorded; promotion suppressed"
+                );
+            }
+        }
+        None => tracing::warn!(
+            capture_id,
+            "reversal for a capture with no open correlation"
+        ),
+    }
+}
+
+async fn paypal_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    let Some(paypal) = state.processors.paypal.as_ref() else {
+        return ApiError::Unavailable.into_response();
+    };
+    let Some(webhook_id) = paypal.webhook_id.as_deref() else {
+        tracing::warn!("webhook received but PAYPAL_WEBHOOK_ID is not configured");
+        return ApiError::Unavailable.into_response();
+    };
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let (
+        Some(transmission_id),
+        Some(transmission_time),
+        Some(transmission_sig),
+        Some(cert_url),
+        Some(auth_algo),
+    ) = (
+        header("paypal-transmission-id"),
+        header("paypal-transmission-time"),
+        header("paypal-transmission-sig"),
+        header("paypal-cert-url"),
+        header("paypal-auth-algo"),
+    )
+    else {
+        return ApiError::InvalidSignature.into_response();
+    };
+    match paypal
+        .verify_webhook(
+            webhook_id,
+            &WebhookHeaders {
+                transmission_id,
+                transmission_time,
+                transmission_sig,
+                cert_url,
+                auth_algo,
+            },
+            &raw_body,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!("paypal webhook signature rejected by verification API");
+            return ApiError::InvalidSignature.into_response();
+        }
+        Err(error) => {
+            // Verification unreachable: fail closed, PayPal will retry.
+            tracing::warn!(%error, "paypal webhook verification unavailable");
+            return ApiError::Unavailable.into_response();
+        }
+    }
+
+    let event: Value = match serde_json::from_slice(&raw_body) {
+        Ok(event) => event,
+        Err(_) => return ApiError::InvalidRequest.into_response(),
+    };
+    let (Some(event_id), Some(event_type)) = (
+        event.get("id").and_then(Value::as_str),
+        event.get("event_type").and_then(Value::as_str),
+    ) else {
+        return ApiError::InvalidRequest.into_response();
+    };
+    match state.store.record_webhook_event(event_id, event_type).await {
+        Ok(true) => {}
+        Ok(false) => return Json(json!({"received": true, "duplicate": true})).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "webhook dedupe persistence failed");
+            return ApiError::Unavailable.into_response();
+        }
+    }
+    let resource = event.get("resource").cloned().unwrap_or(Value::Null);
+    tracing::info!(event_id, event_type, "paypal webhook accepted (hint only)");
+
+    let now = OffsetDateTime::now_utc();
+    match event_type {
+        "CHECKOUT.ORDER.APPROVED"
+        | "CHECKOUT.ORDER.COMPLETED"
+        | "PAYMENT.CAPTURE.COMPLETED"
+        | "PAYMENT.CAPTURE.PENDING" => {
+            // Capture events carry the reference as `custom_id`; order events
+            // carry it inside the first purchase unit.
+            let reference = resource
+                .get("custom_id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    resource
+                        .pointer("/purchase_units/0/custom_id")
+                        .and_then(Value::as_str)
+                });
+            let Some((creator, bundle_id)) = reference.and_then(|value| value.split_once('_'))
+            else {
+                tracing::warn!(event_id, "paypal event carries no parseable custom_id");
+                return Json(json!({"received": true})).into_response();
+            };
+            match state.store.get(creator, bundle_id).await {
+                Ok(Some(correlation)) => {
+                    // The webhook body is a hint. The pull is the fact.
+                    pull_and_apply(&state.store, &state.processors, &correlation, now).await;
+                }
+                Ok(None) => {
+                    tracing::warn!(event_id, "paypal webhook for unknown correlation");
+                }
+                Err(error) => tracing::error!(%error, "correlation lookup failed"),
+            }
+        }
+        "PAYMENT.CAPTURE.REFUNDED" | "PAYMENT.CAPTURE.REVERSED" | "PAYMENT.CAPTURE.DENIED" => {
+            if let Some(capture_id) = reversal_capture_id(&resource) {
+                // Verify the reversal by pulling the capture before acting.
+                match paypal.retrieve_capture(&capture_id).await {
+                    Ok(capture) if is_reversal_capture_status(capture.status.as_deref()) => {
+                        mark_paypal_capture_reversed(
+                            &state,
+                            &capture.id,
+                            capture.custom_id.as_deref(),
+                        )
+                        .await;
+                    }
+                    Ok(_) => tracing::warn!(
+                        capture_id,
+                        "reversal webhook not corroborated by capture pull; ignored"
+                    ),
+                    Err(error) => tracing::error!(%error, capture_id, "capture pull failed"),
+                }
+            }
+        }
+        "CUSTOMER.DISPUTE.CREATED" => {
+            if let Some(dispute_id) = resource.get("dispute_id").and_then(Value::as_str) {
+                // Verify by pulling the dispute; its transactions map to
+                // captures, which map to correlations via the persisted
+                // payment reference.
+                match paypal.retrieve_dispute(dispute_id).await {
+                    Ok(dispute) => {
+                        for transaction in &dispute.disputed_transactions {
+                            if let Some(capture_id) = transaction.seller_transaction_id.as_deref() {
+                                mark_paypal_capture_reversed(&state, capture_id, None).await;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::error!(%error, dispute_id, "dispute pull failed"),
+                }
+            }
+        }
+        other => {
+            tracing::debug!(event_type = other, "ignoring unhandled webhook event type");
+        }
+    }
+    Json(json!({"received": true})).into_response()
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> Response {
     let db_healthy = state.store.healthy().await;
     let body = json!({
         "status": if db_healthy { "ok" } else { "degraded" },
         "database": db_healthy,
-        "stripe_enabled": state.stripe.is_some(),
+        "stripe_enabled": state.processors.stripe.is_some(),
         "stripe_webhook_configured": state
+            .processors
             .stripe
             .as_ref()
             .is_some_and(|stripe| stripe.webhook_secret.is_some()),
+        "paypal_enabled": state.processors.paypal.is_some(),
+        "paypal_webhook_configured": state
+            .processors
+            .paypal
+            .as_ref()
+            .is_some_and(|paypal| paypal.webhook_id.is_some()),
+        "default_processor": state.default_processor.as_str(),
         "version": env!("CARGO_PKG_VERSION"),
     });
     let status = if db_healthy {

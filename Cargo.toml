@@ -3,7 +3,7 @@ name = "pubky-fiat-verifier"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Payment verifier gateway for Locks: speaks the Paykit Server wire contract, proxies BTC to the real Paykit Server, settles fiat criteria through processor plugins (Stripe test mode)."
+description = "Payment verifier gateway for Locks: speaks the Paykit Server wire contract, proxies BTC to the real Paykit Server, settles fiat criteria through processor plugins (Stripe test mode, PayPal sandbox)."
 repository = "https://github.com/BitcoinErrorLog/pubky-fiat-verifier"
 
 [dependencies]
@@ -16,7 +16,7 @@ hmac = "0.12"
 pubky = "=0.8.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_json_canonicalizer = "=0.3.2"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "time", "macros"] }

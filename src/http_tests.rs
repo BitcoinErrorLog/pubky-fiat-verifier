@@ -1,6 +1,9 @@
-//! Handler-level tests: the full router against an in-memory store, a mock
-//! Stripe API, and a mock Paykit Server. Signatures are real ed25519 over
-//! canonical JSON — exactly what the Lock Server sends.
+//! Handler-level tests: the full router against an in-memory store, mock
+//! Stripe and PayPal APIs, and a mock Paykit Server. Signatures are real
+//! ed25519 over canonical JSON — exactly what the Lock Server sends. The
+//! mock PayPal verification postback really verifies: it recomputes an HMAC
+//! over the transmission fields plus a digest of the exact forwarded event
+//! bytes, so a tampered body or a wrong signature yields FAILURE.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,16 +26,22 @@ use tokio::net::TcpListener;
 
 use crate::http::{router, AppState};
 use crate::lock_fetch::{CriterionSource, LockCriterion, LockFetchError};
+use crate::paypal::PaypalProcessor;
 use crate::proxy::PaykitProxy;
 use crate::rate_limit::TokenBucket;
 use crate::store::memory::MemoryStore;
 use crate::store::{CorrelationState, CorrelationStore};
 use crate::stripe::StripeProcessor;
+use crate::verification::{ProcessorKind, Processors};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const READER: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const WEBHOOK_SECRET: &str = "whsec_unit_test";
+const PAYPAL_WEBHOOK_ID: &str = "WH-UNIT-TEST";
+/// Shared secret of the mock verification scheme (stands in for PayPal's
+/// cert-based transmission signature, which only PayPal can produce).
+const PAYPAL_MOCK_VERIFY_KEY: &str = "paypal_mock_transmission_key";
 
 fn locks_key() -> SigningKey {
     SigningKey::from_bytes(&[9_u8; 32])
@@ -162,6 +171,269 @@ async fn mock_get_charge(
     }
 }
 
+// -- mock PayPal ---------------------------------------------------------------
+
+/// The mock transmission signature: HMAC-SHA256 over
+/// `{transmission_id}|{transmission_time}|{webhook_id}|{sha256(event_bytes)}`.
+/// The verify endpoint recomputes it from the postback's own fields and the
+/// exact forwarded `webhook_event` bytes, so tampering is really detected.
+fn paypal_mock_signature(
+    transmission_id: &str,
+    transmission_time: &str,
+    webhook_id: &str,
+    event_bytes: &[u8],
+) -> String {
+    use sha2::Digest;
+    let digest = hex::encode(Sha256::digest(event_bytes));
+    let mut mac = Hmac::<Sha256>::new_from_slice(PAYPAL_MOCK_VERIFY_KEY.as_bytes()).unwrap();
+    mac.update(format!("{transmission_id}|{transmission_time}|{webhook_id}|{digest}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+#[derive(Clone, Default)]
+struct MockPaypal {
+    /// (paypal_request_id, body) per create-order call.
+    creates: Arc<Mutex<Vec<(String, String)>>>,
+    /// order id -> order object returned by retrieve.
+    orders: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    /// capture id -> capture object (GET /v2/payments/captures/:id).
+    captures: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    /// dispute id -> dispute object (GET /v1/customer-disputes/:id).
+    disputes: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    capture_calls: Arc<Mutex<u32>>,
+    counter: Arc<Mutex<u32>>,
+}
+
+impl MockPaypal {
+    fn approve(&self, order_id: &str) {
+        let mut orders = self.orders.lock().unwrap();
+        orders.get_mut(order_id).unwrap()["status"] = json!("APPROVED");
+    }
+
+    /// Simulates PayPal's auto-capture (ORDER_COMPLETE_ON_PAYMENT_APPROVAL):
+    /// the order jumps straight to COMPLETED with a COMPLETED capture.
+    fn complete(&self, order_id: &str) {
+        let capture = {
+            let mut orders = self.orders.lock().unwrap();
+            let order = orders.get_mut(order_id).unwrap();
+            order["status"] = json!("COMPLETED");
+            let capture = json!({
+                "id": format!("ppcap_{order_id}"),
+                "status": "COMPLETED",
+                "amount": order["purchase_units"][0]["amount"].clone(),
+                "custom_id": order["purchase_units"][0]["custom_id"].clone(),
+            });
+            order["purchase_units"][0]["payments"] = json!({"captures": [capture.clone()]});
+            capture
+        };
+        self.captures
+            .lock()
+            .unwrap()
+            .insert(capture["id"].as_str().unwrap().to_owned(), capture);
+    }
+
+    fn set_capture_amount(&self, order_id: &str, value: &str) {
+        let capture_id = format!("ppcap_{order_id}");
+        {
+            let mut orders = self.orders.lock().unwrap();
+            let order = orders.get_mut(order_id).unwrap();
+            order["purchase_units"][0]["payments"]["captures"][0]["amount"]["value"] = json!(value);
+        }
+        let mut captures = self.captures.lock().unwrap();
+        captures.get_mut(&capture_id).unwrap()["amount"]["value"] = json!(value);
+    }
+
+    fn set_capture_status(&self, order_id: &str, status: &str) {
+        let capture_id = format!("ppcap_{order_id}");
+        let mut captures = self.captures.lock().unwrap();
+        captures.get_mut(&capture_id).unwrap()["status"] = json!(status);
+    }
+
+    fn set_dispute(&self, dispute_id: &str, capture_id: &str) {
+        self.disputes.lock().unwrap().insert(
+            dispute_id.to_owned(),
+            json!({
+                "dispute_id": dispute_id,
+                "status": "OPEN",
+                "disputed_transactions": [{"seller_transaction_id": capture_id}],
+            }),
+        );
+    }
+}
+
+async fn mock_paypal_token() -> impl IntoResponse {
+    Json(json!({
+        "access_token": "mock_paypal_token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }))
+}
+
+async fn mock_paypal_create_order(
+    State(mock): State<MockPaypal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let request_id = headers
+        .get("paypal-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    {
+        let creates = mock.creates.lock().unwrap();
+        // PayPal-Request-Id idempotency: same id returns the same order.
+        for (index, (key, _)) in creates.iter().enumerate() {
+            if *key == request_id {
+                let id = format!("pporder_{}", index + 1);
+                let order = mock.orders.lock().unwrap().get(&id).cloned().unwrap();
+                return Json(order);
+            }
+        }
+    }
+    let parsed: Value = serde_json::from_str(&body_text).unwrap();
+    let mut counter = mock.counter.lock().unwrap();
+    *counter += 1;
+    let id = format!("pporder_{}", *counter);
+    let order = json!({
+        "id": id,
+        "status": "CREATED",
+        "intent": parsed["intent"],
+        "processing_instruction": parsed["processing_instruction"],
+        "purchase_units": [{
+            "custom_id": parsed["purchase_units"][0]["custom_id"],
+            "amount": parsed["purchase_units"][0]["amount"],
+        }],
+        "links": [
+            {"rel": "self",
+             "href": format!("https://api.sandbox.paypal.test/v2/checkout/orders/{id}")},
+            {"rel": "payer-action",
+             "href": format!("https://sandbox.paypal.test/checkoutnow?token={id}")}
+        ]
+    });
+    mock.orders
+        .lock()
+        .unwrap()
+        .insert(id.clone(), order.clone());
+    mock.creates.lock().unwrap().push((request_id, body_text));
+    Json(order)
+}
+
+async fn mock_paypal_get_order(
+    State(mock): State<MockPaypal>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match mock.orders.lock().unwrap().get(&id) {
+        Some(order) => Json(order.clone()).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"name": "RESOURCE_NOT_FOUND"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn mock_paypal_capture_order(
+    State(mock): State<MockPaypal>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let capture = {
+        let mut orders = mock.orders.lock().unwrap();
+        let Some(order) = orders.get_mut(&id) else {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({"name": "RESOURCE_NOT_FOUND"})),
+            )
+                .into_response();
+        };
+        if order["status"] != json!("APPROVED") {
+            return (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"name": "UNPROCESSABLE_ENTITY",
+                            "details": [{"issue": "ORDER_NOT_APPROVED"}]})),
+            )
+                .into_response();
+        }
+        *mock.capture_calls.lock().unwrap() += 1;
+        order["status"] = json!("COMPLETED");
+        let capture = json!({
+            "id": format!("ppcap_{id}"),
+            "status": "COMPLETED",
+            "amount": order["purchase_units"][0]["amount"].clone(),
+            "custom_id": order["purchase_units"][0]["custom_id"].clone(),
+        });
+        order["purchase_units"][0]["payments"] = json!({"captures": [capture.clone()]});
+        let response = order.clone();
+        mock.captures
+            .lock()
+            .unwrap()
+            .insert(capture["id"].as_str().unwrap().to_owned(), capture);
+        response
+    };
+    Json(capture).into_response()
+}
+
+async fn mock_paypal_get_capture(
+    State(mock): State<MockPaypal>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match mock.captures.lock().unwrap().get(&id) {
+        Some(capture) => Json(capture.clone()).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"name": "RESOURCE_NOT_FOUND"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn mock_paypal_get_dispute(
+    State(mock): State<MockPaypal>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match mock.disputes.lock().unwrap().get(&id) {
+        Some(dispute) => Json(dispute.clone()).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"name": "RESOURCE_NOT_FOUND"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Really verifies: recomputes the mock transmission signature from the
+/// postback's own fields and the exact bytes of the forwarded event.
+async fn mock_paypal_verify_webhook(body: Bytes) -> axum::response::Response {
+    #[derive(serde::Deserialize)]
+    struct Postback {
+        transmission_id: String,
+        transmission_sig: String,
+        transmission_time: String,
+        webhook_id: String,
+        webhook_event: Box<serde_json::value::RawValue>,
+    }
+    let Ok(postback) = serde_json::from_slice::<Postback>(&body) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"name": "INVALID_REQUEST"})),
+        )
+            .into_response();
+    };
+    let expected = paypal_mock_signature(
+        &postback.transmission_id,
+        &postback.transmission_time,
+        &postback.webhook_id,
+        postback.webhook_event.get().as_bytes(),
+    );
+    let status =
+        if postback.webhook_id == PAYPAL_WEBHOOK_ID && postback.transmission_sig == expected {
+            "SUCCESS"
+        } else {
+            "FAILURE"
+        };
+    Json(json!({"verification_status": status})).into_response()
+}
+
 // -- mock Paykit Server -------------------------------------------------------
 
 /// (path, forwarded signature header, forwarded raw body)
@@ -208,9 +480,29 @@ struct Harness {
     base: String,
     store: Arc<dyn CorrelationStore>,
     stripe_mock: MockStripe,
+    paypal_mock: MockPaypal,
     paykit_mock: MockPaykit,
     http: reqwest::Client,
     settlement_delay: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct HarnessOptions {
+    settlement_delay: Duration,
+    with_stripe: bool,
+    with_paypal: bool,
+    paypal_webhook_id: bool,
+}
+
+impl Default for HarnessOptions {
+    fn default() -> Self {
+        Self {
+            settlement_delay: Duration::from_secs(300),
+            with_stripe: true,
+            with_paypal: false,
+            paypal_webhook_id: true,
+        }
+    }
 }
 
 async fn spawn(app: Router) -> String {
@@ -222,7 +514,7 @@ async fn spawn(app: Router) -> String {
     format!("http://{addr}")
 }
 
-async fn harness_with_delay(settlement_delay: Duration) -> Harness {
+async fn build_harness(options: HarnessOptions) -> Harness {
     let stripe_mock = MockStripe::default();
     let stripe_url = spawn(
         Router::new()
@@ -230,6 +522,26 @@ async fn harness_with_delay(settlement_delay: Duration) -> Harness {
             .route("/v1/checkout/sessions/{id}", get(mock_get_session))
             .route("/v1/charges/{id}", get(mock_get_charge))
             .with_state(stripe_mock.clone()),
+    )
+    .await;
+
+    let paypal_mock = MockPaypal::default();
+    let paypal_url = spawn(
+        Router::new()
+            .route("/v1/oauth2/token", post(mock_paypal_token))
+            .route("/v2/checkout/orders", post(mock_paypal_create_order))
+            .route("/v2/checkout/orders/{id}", get(mock_paypal_get_order))
+            .route(
+                "/v2/checkout/orders/{id}/capture",
+                post(mock_paypal_capture_order),
+            )
+            .route("/v2/payments/captures/{id}", get(mock_paypal_get_capture))
+            .route("/v1/customer-disputes/{id}", get(mock_paypal_get_dispute))
+            .route(
+                "/v1/notifications/verify-webhook-signature",
+                post(mock_paypal_verify_webhook),
+            )
+            .with_state(paypal_mock.clone()),
     )
     .await;
 
@@ -279,17 +591,36 @@ async fn harness_with_delay(settlement_delay: Duration) -> Harness {
     );
 
     let store: Arc<dyn CorrelationStore> = Arc::new(MemoryStore::default());
+    let processors = Arc::new(Processors {
+        stripe: options.with_stripe.then(|| {
+            Arc::new(StripeProcessor::new(
+                url::Url::parse(&stripe_url).unwrap(),
+                "sk_test_unit".into(),
+                Some(WEBHOOK_SECRET.into()),
+            ))
+        }),
+        paypal: options.with_paypal.then(|| {
+            Arc::new(PaypalProcessor::new(
+                url::Url::parse(&paypal_url).unwrap(),
+                "paypal_client_unit".into(),
+                "paypal_secret_unit".into(),
+                options
+                    .paypal_webhook_id
+                    .then(|| PAYPAL_WEBHOOK_ID.to_owned()),
+            ))
+        }),
+    });
+    let default_processor = processors
+        .sole_configured()
+        .unwrap_or(ProcessorKind::Stripe);
     let state = Arc::new(AppState {
         trusted_key: locks_key().verifying_key(),
         store: store.clone(),
-        stripe: Some(Arc::new(StripeProcessor::new(
-            url::Url::parse(&stripe_url).unwrap(),
-            "sk_test_unit".into(),
-            Some(WEBHOOK_SECRET.into()),
-        ))),
+        processors,
+        default_processor,
         criterion_source: Arc::new(StaticCriteria(Mutex::new(criteria))),
         proxy: Arc::new(PaykitProxy::new(url::Url::parse(&paykit_url).unwrap())),
-        settlement_delay,
+        settlement_delay: options.settlement_delay,
         synthesized_confirmations: 1,
         allowed_assets: vec!["USD".into()],
         checkout_success_url: "https://app.test/success".into(),
@@ -301,14 +632,43 @@ async fn harness_with_delay(settlement_delay: Duration) -> Harness {
         base,
         store,
         stripe_mock,
+        paypal_mock,
         paykit_mock,
         http: reqwest::Client::new(),
-        settlement_delay,
+        settlement_delay: options.settlement_delay,
     }
 }
 
+async fn harness_with_delay(settlement_delay: Duration) -> Harness {
+    build_harness(HarnessOptions {
+        settlement_delay,
+        ..HarnessOptions::default()
+    })
+    .await
+}
+
 async fn harness() -> Harness {
-    harness_with_delay(Duration::from_secs(300)).await
+    build_harness(HarnessOptions::default()).await
+}
+
+async fn harness_paypal_only(settlement_delay: Duration) -> Harness {
+    build_harness(HarnessOptions {
+        settlement_delay,
+        with_stripe: false,
+        with_paypal: true,
+        ..HarnessOptions::default()
+    })
+    .await
+}
+
+async fn harness_dual(settlement_delay: Duration) -> Harness {
+    build_harness(HarnessOptions {
+        settlement_delay,
+        with_stripe: true,
+        with_paypal: true,
+        ..HarnessOptions::default()
+    })
+    .await
 }
 
 impl Harness {
@@ -359,6 +719,59 @@ impl Harness {
             .post(format!("{}/webhooks/stripe", self.base))
             .header("stripe-signature", self.webhook_signature(now, &payload))
             .body(payload)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Delivers a PayPal webhook whose transmission signature covers
+    /// `signed_over` — pass the payload itself for a valid delivery, or
+    /// different bytes to simulate tampering.
+    async fn send_paypal_webhook_signed_over(
+        &self,
+        payload: Vec<u8>,
+        signed_over: &[u8],
+    ) -> reqwest::Response {
+        use sha2::Digest;
+        let transmission_id = format!("tx-{}", hex::encode(&Sha256::digest(&payload)[..6]));
+        let transmission_time = "2026-08-22T00:00:00Z";
+        let signature = paypal_mock_signature(
+            &transmission_id,
+            transmission_time,
+            PAYPAL_WEBHOOK_ID,
+            signed_over,
+        );
+        self.http
+            .post(format!("{}/webhooks/paypal", self.base))
+            .header("paypal-transmission-id", transmission_id)
+            .header("paypal-transmission-time", transmission_time)
+            .header("paypal-transmission-sig", signature)
+            .header(
+                "paypal-cert-url",
+                "https://api.sandbox.paypal.test/cert.pem",
+            )
+            .header("paypal-auth-algo", "SHA256withRSA")
+            .body(payload)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn send_paypal_webhook(&self, event: &Value) -> reqwest::Response {
+        let payload = serde_json::to_vec(event).unwrap();
+        let signed_over = payload.clone();
+        self.send_paypal_webhook_signed_over(payload, &signed_over)
+            .await
+    }
+
+    async fn checkout(&self, bundle: &str, processor: Option<&str>) -> reqwest::Response {
+        let mut body = json!({"creator": CREATOR, "bundle_id": bundle});
+        if let Some(processor) = processor {
+            body["processor"] = json!(processor);
+        }
+        self.http
+            .post(format!("{}/checkout-sessions", self.base))
+            .json(&body)
             .send()
             .await
             .unwrap()
@@ -648,6 +1061,7 @@ async fn checkout_sessions_returns_url_and_reminting_only_after_expiry() {
         .set_session(
             CREATOR,
             BUNDLE,
+            "stripe",
             "cs_test_1",
             first["checkout_url"].as_str().unwrap(),
             1,
@@ -734,4 +1148,467 @@ async fn health_reports_ok() {
         .unwrap();
     assert_eq!(health["status"], "ok");
     assert_eq!(health["stripe_enabled"], true);
+    assert_eq!(health["paypal_enabled"], false);
+    assert_eq!(health["paypal_webhook_configured"], false);
+    assert_eq!(health["default_processor"], "stripe");
+}
+
+// -- PayPal leg -------------------------------------------------------------------
+
+#[tokio::test]
+async fn paypal_only_invoice_mints_order_eagerly_and_idempotently() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    // Exact replay: same identity, same terms -> 204, no second order.
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    assert_eq!(harness.paypal_mock.creates.lock().unwrap().len(), 1);
+
+    let (request_id, body) = harness.paypal_mock.creates.lock().unwrap()[0].clone();
+    assert!(request_id.starts_with("fiatv1-"));
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["intent"], "CAPTURE");
+    assert_eq!(
+        body["processing_instruction"],
+        "ORDER_COMPLETE_ON_PAYMENT_APPROVAL"
+    );
+    assert_eq!(
+        body["purchase_units"][0]["custom_id"],
+        format!("{CREATOR}_{BUNDLE}")
+    );
+    assert_eq!(body["purchase_units"][0]["amount"]["currency_code"], "USD");
+    assert_eq!(body["purchase_units"][0]["amount"]["value"], "19.99");
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Created);
+    assert_eq!(row.processor.as_deref(), Some("paypal"));
+    assert_eq!(row.session_id.as_deref(), Some("pporder_1"));
+
+    let checkout: Value = harness.checkout(BUNDLE, None).await.json().await.unwrap();
+    assert_eq!(checkout["processor"], "paypal");
+    assert_eq!(
+        checkout["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_1"
+    );
+}
+
+#[tokio::test]
+async fn dual_processor_invoice_defers_mint_and_checkout_binds_default() {
+    let harness = harness_dual(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    // Both processors configured: no session yet, the buyer chooses.
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert!(row.session_id.is_none());
+    assert!(row.processor.is_none());
+    assert!(harness.stripe_mock.creates.lock().unwrap().is_empty());
+    assert!(harness.paypal_mock.creates.lock().unwrap().is_empty());
+
+    // No processor named -> deployment default (stripe).
+    let checkout: Value = harness.checkout(BUNDLE, None).await.json().await.unwrap();
+    assert_eq!(checkout["processor"], "stripe");
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.processor.as_deref(), Some("stripe"));
+
+    // The binding is permanent: asking for paypal afterwards conflicts.
+    let switched = harness.checkout(BUNDLE, Some("paypal")).await;
+    assert_eq!(switched.status().as_u16(), 409);
+
+    // Asking for the bound processor returns the same live session.
+    let repeat: Value = harness
+        .checkout(BUNDLE, Some("stripe"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeat["checkout_url"], checkout["checkout_url"]);
+}
+
+#[tokio::test]
+async fn dual_processor_checkout_can_choose_paypal() {
+    let harness = harness_dual(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let checkout: Value = harness
+        .checkout(BUNDLE, Some("paypal"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(checkout["processor"], "paypal");
+    assert_eq!(
+        checkout["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_1"
+    );
+    assert!(harness.stripe_mock.creates.lock().unwrap().is_empty());
+
+    // Idempotent repeat, and stripe is now a conflicting choice.
+    let repeat: Value = harness
+        .checkout(BUNDLE, Some("paypal"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeat["checkout_url"], checkout["checkout_url"]);
+    assert_eq!(harness.paypal_mock.creates.lock().unwrap().len(), 1);
+    assert_eq!(
+        harness
+            .checkout(BUNDLE, Some("stripe"))
+            .await
+            .status()
+            .as_u16(),
+        409
+    );
+}
+
+#[tokio::test]
+async fn checkout_rejects_unknown_processor_value() {
+    let harness = harness_dual(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    let response = harness.checkout(BUNDLE, Some("venmo")).await;
+    assert_eq!(response.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn paypal_full_lifecycle_approval_webhook_capture_then_settlement() {
+    let harness = harness_paypal_only(Duration::from_secs(2)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    // Buyer approves at PayPal; the auto-capture has not landed yet, so the
+    // pull observes APPROVED and captures explicitly (capture-on-approval).
+    harness.paypal_mock.approve("pporder_1");
+    let event = json!({
+        "id": "WH-EVT-APPROVED-1",
+        "event_type": "CHECKOUT.ORDER.APPROVED",
+        "resource": {
+            "id": "pporder_1",
+            "status": "APPROVED",
+            "purchase_units": [{"custom_id": format!("{CREATOR}_{BUNDLE}")}]
+        }
+    });
+    assert_eq!(
+        harness.send_paypal_webhook(&event).await.status().as_u16(),
+        200
+    );
+    assert_eq!(*harness.paypal_mock.capture_calls.lock().unwrap(), 1);
+
+    // Inside the settlement delay: detected, never confirmed.
+    let status = harness.status(BUNDLE).await;
+    assert_eq!(
+        status,
+        json!({"status": "detected", "confirmations": 0, "amount_matched": true})
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Paid);
+    assert_eq!(row.payment_intent.as_deref(), Some("ppcap_pporder_1"));
+
+    // After the delay: the status call re-pulls and promotes.
+    tokio::time::sleep(harness.settlement_delay + Duration::from_millis(200)).await;
+    let status = harness.status(BUNDLE).await;
+    assert_eq!(
+        status,
+        json!({"status": "confirmed", "confirmations": 1, "amount_matched": true})
+    );
+}
+
+#[tokio::test]
+async fn paypal_detection_works_without_webhooks_via_status_poll() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    // PayPal auto-captured on approval; no webhook at all: the Lock Server's
+    // own status poll triggers the pull.
+    harness.paypal_mock.complete("pporder_1");
+    let status = harness.status(BUNDLE).await;
+    assert_eq!(status["status"], "detected");
+    assert_eq!(status["amount_matched"], true);
+}
+
+#[tokio::test]
+async fn paypal_webhook_hint_is_overruled_by_unpaid_pull() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    // A webhook claims a completed capture, but the order pull still says
+    // CREATED. The pull wins: nothing moves.
+    let event = json!({
+        "id": "WH-EVT-LIE-1",
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {
+            "id": "ppcap_pporder_1",
+            "status": "COMPLETED",
+            "custom_id": format!("{CREATOR}_{BUNDLE}")
+        }
+    });
+    assert_eq!(
+        harness.send_paypal_webhook(&event).await.status().as_u16(),
+        200
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Created);
+    assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
+}
+
+#[tokio::test]
+async fn paypal_webhook_with_wrong_signature_is_rejected() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+
+    let payload = serde_json::to_vec(&json!({
+        "id": "WH-EVT-BADSIG",
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {"custom_id": format!("{CREATOR}_{BUNDLE}")}
+    }))
+    .unwrap();
+    let response = harness
+        .http
+        .post(format!("{}/webhooks/paypal", harness.base))
+        .header("paypal-transmission-id", "tx-forged")
+        .header("paypal-transmission-time", "2026-08-22T00:00:00Z")
+        .header("paypal-transmission-sig", "deadbeef")
+        .header(
+            "paypal-cert-url",
+            "https://api.sandbox.paypal.test/cert.pem",
+        )
+        .header("paypal-auth-algo", "SHA256withRSA")
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    // A rejected webhook schedules nothing: state is untouched even though
+    // the order is genuinely paid (the next verified pull will catch it).
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Created);
+}
+
+#[tokio::test]
+async fn paypal_webhook_with_tampered_body_fails_postback_verification() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let genuine = serde_json::to_vec(&json!({
+        "id": "WH-EVT-TAMPER",
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {"custom_id": format!("{CREATOR}_{BUNDLE}")}
+    }))
+    .unwrap();
+    let tampered = serde_json::to_vec(&json!({
+        "id": "WH-EVT-TAMPER",
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {"custom_id": format!("{CREATOR}_OTHERBUNDLE1")}
+    }))
+    .unwrap();
+    // Signature covers the genuine bytes; the delivered body differs.
+    let response = harness
+        .send_paypal_webhook_signed_over(tampered, &genuine)
+        .await;
+    assert_eq!(response.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn paypal_webhook_fails_closed_without_configuration() {
+    // Stripe-only deployment: the PayPal webhook path answers 503.
+    let harness = harness().await;
+    let response = harness
+        .http
+        .post(format!("{}/webhooks/paypal", harness.base))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+
+    // PayPal configured but no webhook id: also 503 (poll-only detection).
+    let harness = build_harness(HarnessOptions {
+        with_stripe: false,
+        with_paypal: true,
+        paypal_webhook_id: false,
+        ..HarnessOptions::default()
+    })
+    .await;
+    let response = harness
+        .http
+        .post(format!("{}/webhooks/paypal", harness.base))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+}
+
+#[tokio::test]
+async fn paypal_amount_mismatch_is_reported_and_never_promotes() {
+    let harness = harness_paypal_only(Duration::from_secs(0)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    harness.paypal_mock.set_capture_amount("pporder_1", "0.01");
+
+    let status = harness.status(BUNDLE).await;
+    assert_eq!(
+        status,
+        json!({"status": "detected", "confirmations": 0, "amount_matched": false})
+    );
+    // Even with a zero delay it must not confirm.
+    let status = harness.status(BUNDLE).await;
+    assert_eq!(status["status"], "detected");
+    assert_eq!(status["amount_matched"], false);
+}
+
+#[tokio::test]
+async fn paypal_refund_reversal_blocks_promotion() {
+    let harness = harness_paypal_only(Duration::from_secs(600)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    let _ = harness.status(BUNDLE).await; // detected; payment ref = ppcap_pporder_1
+    harness
+        .paypal_mock
+        .set_capture_status("pporder_1", "REFUNDED");
+
+    // The refund event's resource is the refund, linking up to the capture.
+    let event = json!({
+        "id": "WH-EVT-REFUND-1",
+        "event_type": "PAYMENT.CAPTURE.REFUNDED",
+        "resource": {
+            "id": "pprefund_1",
+            "status": "COMPLETED",
+            "links": [
+                {"rel": "up",
+                 "href": "https://api.sandbox.paypal.test/v2/payments/captures/ppcap_pporder_1"}
+            ]
+        }
+    });
+    assert_eq!(
+        harness.send_paypal_webhook(&event).await.status().as_u16(),
+        200
+    );
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Reversed);
+    assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
+}
+
+#[tokio::test]
+async fn paypal_reversal_webhook_not_corroborated_by_pull_is_ignored() {
+    let harness = harness_paypal_only(Duration::from_secs(600)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    let _ = harness.status(BUNDLE).await; // detected
+
+    // Refund webhook, but the capture pull still says COMPLETED: ignored.
+    let event = json!({
+        "id": "WH-EVT-REFUND-FAKE",
+        "event_type": "PAYMENT.CAPTURE.REFUNDED",
+        "resource": {
+            "id": "pprefund_x",
+            "links": [
+                {"rel": "up",
+                 "href": "https://api.sandbox.paypal.test/v2/payments/captures/ppcap_pporder_1"}
+            ]
+        }
+    });
+    assert_eq!(
+        harness.send_paypal_webhook(&event).await.status().as_u16(),
+        200
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Paid);
+}
+
+#[tokio::test]
+async fn paypal_dispute_marks_correlation_reversed() {
+    let harness = harness_paypal_only(Duration::from_secs(600)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    harness.paypal_mock.complete("pporder_1");
+    let _ = harness.status(BUNDLE).await; // detected; payment ref persisted
+    harness.paypal_mock.set_dispute("PP-D-1", "ppcap_pporder_1");
+
+    let event = json!({
+        "id": "WH-EVT-DISPUTE-1",
+        "event_type": "CUSTOMER.DISPUTE.CREATED",
+        "resource": {
+            "dispute_id": "PP-D-1",
+            "disputed_transactions": [{"seller_transaction_id": "ppcap_pporder_1"}]
+        }
+    });
+    assert_eq!(
+        harness.send_paypal_webhook(&event).await.status().as_u16(),
+        200
+    );
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.state, CorrelationState::Reversed);
+    assert_eq!(harness.status(BUNDLE).await["status"], "undetected");
+}
+
+#[tokio::test]
+async fn paypal_duplicate_webhook_events_are_deduplicated() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    let event = json!({
+        "id": "WH-EVT-DUP",
+        "event_type": "CHECKOUT.ORDER.APPROVED",
+        "resource": {"purchase_units": [{"custom_id": format!("{CREATOR}_{BUNDLE}")}]}
+    });
+    let first: Value = harness
+        .send_paypal_webhook(&event)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first, json!({"received": true}));
+    let second: Value = harness
+        .send_paypal_webhook(&event)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second, json!({"received": true, "duplicate": true}));
+}
+
+#[tokio::test]
+async fn paypal_checkout_remints_on_the_same_processor_after_expiry() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    let first: Value = harness.checkout(BUNDLE, None).await.json().await.unwrap();
+
+    // Force expiry -> replacement is minted, still on paypal.
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "paypal",
+            "pporder_1",
+            first["checkout_url"].as_str().unwrap(),
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    let reminted: Value = harness.checkout(BUNDLE, None).await.json().await.unwrap();
+    assert_eq!(reminted["processor"], "paypal");
+    assert_eq!(
+        reminted["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_2"
+    );
+    assert_eq!(harness.paypal_mock.creates.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn paypal_health_reports_processor_flags() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    let health: Value = harness
+        .http
+        .get(format!("{}/health", harness.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["stripe_enabled"], false);
+    assert_eq!(health["paypal_enabled"], true);
+    assert_eq!(health["paypal_webhook_configured"], true);
+    assert_eq!(health["default_processor"], "paypal");
 }

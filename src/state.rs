@@ -78,6 +78,7 @@ mod tests {
             asset: "USD".into(),
             amount_minor: 1999,
             state,
+            processor: Some("stripe".into()),
             session_id: Some("cs_test_1".into()),
             checkout_url: Some("https://checkout.stripe.com/c/pay/x".into()),
             checkout_expires_at: None,

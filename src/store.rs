@@ -36,6 +36,11 @@ pub struct Correlation {
     pub asset: String,
     pub amount_minor: i64,
     pub state: CorrelationState,
+    /// Which processor the session/order belongs to (`stripe` | `paypal`).
+    /// Bound when the session is minted and never rebound (fail-closed: a
+    /// switch could leave a payable session on the abandoned processor).
+    /// Rows minted before this column existed are Stripe rows.
+    pub processor: Option<String>,
     pub session_id: Option<String>,
     pub checkout_url: Option<String>,
     pub checkout_expires_at: Option<i64>,
@@ -76,10 +81,12 @@ pub struct StoreError(pub String);
 pub trait CorrelationStore: Send + Sync {
     async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError>;
     async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError>;
+    #[allow(clippy::too_many_arguments)]
     async fn set_session(
         &self,
         creator: &str,
         bundle_id: &str,
+        processor: &str,
         session_id: &str,
         checkout_url: &str,
         checkout_expires_at: i64,
@@ -138,6 +145,7 @@ CREATE TABLE IF NOT EXISTS correlations (
     asset TEXT NOT NULL,
     amount_minor BIGINT NOT NULL,
     state TEXT NOT NULL DEFAULT 'created',
+    processor TEXT,
     session_id TEXT,
     checkout_url TEXT,
     checkout_expires_at BIGINT,
@@ -150,6 +158,7 @@ CREATE TABLE IF NOT EXISTS correlations (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (creator, bundle_id)
 );
+ALTER TABLE correlations ADD COLUMN IF NOT EXISTS processor TEXT;
 CREATE INDEX IF NOT EXISTS correlations_payment_intent_idx
     ON correlations (payment_intent) WHERE payment_intent IS NOT NULL;
 CREATE INDEX IF NOT EXISTS correlations_open_idx
@@ -188,6 +197,7 @@ fn row_to_correlation(row: sqlx::postgres::PgRow) -> Result<Correlation, StoreEr
         amount_minor: row.try_get("amount_minor").map_err(db_err)?,
         state: CorrelationState::parse(&state)
             .ok_or_else(|| StoreError(format!("unknown state '{state}'")))?,
+        processor: row.try_get("processor").map_err(db_err)?,
         session_id: row.try_get("session_id").map_err(db_err)?,
         checkout_url: row.try_get("checkout_url").map_err(db_err)?,
         checkout_expires_at: row.try_get("checkout_expires_at").map_err(db_err)?,
@@ -203,8 +213,8 @@ fn db_err(error: sqlx::Error) -> StoreError {
 }
 
 const SELECT_COLUMNS: &str = "creator, bundle_id, lock_resource, reader, asset, amount_minor, \
-     state, session_id, checkout_url, checkout_expires_at, session_attempt, payment_intent, \
-     amount_matched, paid_at";
+     state, processor, session_id, checkout_url, checkout_expires_at, session_attempt, \
+     payment_intent, amount_matched, paid_at";
 
 #[async_trait]
 impl CorrelationStore for PostgresStore {
@@ -256,18 +266,20 @@ impl CorrelationStore for PostgresStore {
         &self,
         creator: &str,
         bundle_id: &str,
+        processor: &str,
         session_id: &str,
         checkout_url: &str,
         checkout_expires_at: i64,
         session_attempt: i32,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "UPDATE correlations SET session_id = $3, checkout_url = $4, \
-             checkout_expires_at = $5, session_attempt = $6, updated_at = now() \
+            "UPDATE correlations SET processor = $3, session_id = $4, checkout_url = $5, \
+             checkout_expires_at = $6, session_attempt = $7, updated_at = now() \
              WHERE creator = $1 AND bundle_id = $2",
         )
         .bind(creator)
         .bind(bundle_id)
+        .bind(processor)
         .bind(session_id)
         .bind(checkout_url)
         .bind(checkout_expires_at)
@@ -427,6 +439,7 @@ pub mod memory {
                     asset: new.asset,
                     amount_minor: new.amount_minor,
                     state: CorrelationState::Created,
+                    processor: None,
                     session_id: None,
                     checkout_url: None,
                     checkout_expires_at: None,
@@ -456,6 +469,7 @@ pub mod memory {
             &self,
             creator: &str,
             bundle_id: &str,
+            processor: &str,
             session_id: &str,
             checkout_url: &str,
             checkout_expires_at: i64,
@@ -463,6 +477,7 @@ pub mod memory {
         ) -> Result<(), StoreError> {
             let mut rows = self.rows.lock().unwrap();
             if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
+                row.processor = Some(processor.to_owned());
                 row.session_id = Some(session_id.to_owned());
                 row.checkout_url = Some(checkout_url.to_owned());
                 row.checkout_expires_at = Some(checkout_expires_at);

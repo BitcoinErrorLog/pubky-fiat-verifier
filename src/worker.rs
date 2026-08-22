@@ -9,12 +9,11 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::store::{CorrelationState, CorrelationStore};
-use crate::stripe::StripeProcessor;
-use crate::verification::{pull_and_apply, PullOutcome};
+use crate::verification::{pull_and_apply, Processors, PullOutcome};
 
 pub async fn run(
     store: Arc<dyn CorrelationStore>,
-    stripe: Arc<StripeProcessor>,
+    processors: Arc<Processors>,
     poll_interval: Duration,
     settlement_delay: Duration,
 ) {
@@ -31,7 +30,7 @@ pub async fn run(
         };
         for correlation in open {
             let now = OffsetDateTime::now_utc();
-            let outcome = pull_and_apply(&store, &stripe, &correlation, now).await;
+            let outcome = pull_and_apply(&store, &processors, &correlation, now).await;
             if !matches!(
                 outcome,
                 PullOutcome::Paid {

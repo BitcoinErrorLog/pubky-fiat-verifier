@@ -45,6 +45,11 @@ pub struct TransactionStatus {
 pub struct CheckoutSessionRequest {
     pub creator: String,
     pub bundle_id: String,
+    /// Optional processor choice (`stripe` | `paypal`), honored only while
+    /// the correlation is not yet bound to a processor; afterwards a
+    /// mismatch is a 409. Defaults to the deployment's default processor.
+    #[serde(default)]
+    pub processor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

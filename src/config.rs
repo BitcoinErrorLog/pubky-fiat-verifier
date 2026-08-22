@@ -19,6 +19,11 @@ pub enum ConfigError {
          (staging is test-mode only by design)"
     )]
     LiveKeyWithoutLiveMode,
+    #[error(
+        "PAYPAL_API_BASE is not the PayPal sandbox; refusing to start without \
+         FIAT_LIVE_MODE=true (staging is sandbox-only by design)"
+    )]
+    LivePaypalWithoutLiveMode,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +36,17 @@ pub struct StripeConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct PaypalConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    /// Webhook id from the PayPal developer dashboard (`WH-...`). Optional:
+    /// without it the webhook endpoint fails closed and payment observation
+    /// relies on the API poll.
+    pub webhook_id: Option<String>,
+    pub api_base: Url,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: String,
     /// The one Lock Server identity whose ed25519 signature authenticates the
@@ -39,8 +55,14 @@ pub struct Config {
     /// The real Paykit Server: BTC criteria are proxied here verbatim.
     pub paykit_server_url: Url,
     pub database_url: String,
-    /// None => fiat processing disabled; USD invoices fail closed with 503.
+    /// None => Stripe disabled. With no processor configured at all, fiat
+    /// invoices fail closed with 503.
     pub stripe: Option<StripeConfig>,
+    /// None => PayPal disabled; the PayPal path fails closed with 503.
+    pub paypal: Option<PaypalConfig>,
+    /// Processor used when a checkout request names none and both are
+    /// configured (`stripe` | `paypal`).
+    pub default_processor: String,
     /// Fiat analogue of block confirmations: how long a paid checkout must
     /// rest before the verifier reports `confirmed` (design §3.4, §5.1).
     pub settlement_delay: Duration,
@@ -116,6 +138,60 @@ impl Config {
             _ => None,
         };
 
+        let optional = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let paypal = match (
+            optional("PAYPAL_CLIENT_ID"),
+            optional("PAYPAL_CLIENT_SECRET"),
+        ) {
+            (Some(client_id), Some(client_secret)) => {
+                let live_mode = std::env::var("FIAT_LIVE_MODE").is_ok_and(|v| v == "true");
+                let api_base = Url::parse(
+                    &std::env::var("PAYPAL_API_BASE")
+                        .unwrap_or_else(|_| "https://api-m.sandbox.paypal.com".to_owned()),
+                )
+                .map_err(|error| ConfigError::Invalid("PAYPAL_API_BASE", error.to_string()))?;
+                let looks_sandbox = api_base
+                    .host_str()
+                    .is_some_and(|host| host.contains("sandbox"));
+                if !looks_sandbox && !live_mode {
+                    return Err(ConfigError::LivePaypalWithoutLiveMode);
+                }
+                let webhook_id = std::env::var("PAYPAL_WEBHOOK_ID")
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty());
+                Some(PaypalConfig {
+                    client_id,
+                    client_secret,
+                    webhook_id,
+                    api_base,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "PAYPAL_CLIENT_ID",
+                    "PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET must be set together".to_owned(),
+                ))
+            }
+        };
+
+        let default_processor = std::env::var("FIAT_DEFAULT_PROCESSOR")
+            .unwrap_or_else(|_| "stripe".to_owned())
+            .trim()
+            .to_ascii_lowercase();
+        if default_processor != "stripe" && default_processor != "paypal" {
+            return Err(ConfigError::Invalid(
+                "FIAT_DEFAULT_PROCESSOR",
+                "must be 'stripe' or 'paypal'".to_owned(),
+            ));
+        }
+
         let settlement_delay =
             Duration::from_secs(parse_u64("FIAT_SETTLEMENT_DELAY_SECONDS", 300)?);
         let synthesized_confirmations =
@@ -150,6 +226,8 @@ impl Config {
             paykit_server_url,
             database_url,
             stripe,
+            paypal,
+            default_processor,
             settlement_delay,
             synthesized_confirmations,
             poll_interval,
