@@ -109,6 +109,7 @@ async fn main() {
         allowed_assets: config.allowed_assets.clone(),
         checkout_success_url: config.checkout_success_url.clone(),
         checkout_cancel_url: config.checkout_cancel_url.clone(),
+        buyer_return_origins: config.buyer_return_origins.clone(),
         checkout_limiter: TokenBucket::new(
             config.checkout_rate_per_second,
             config.checkout_rate_burst,
@@ -124,6 +125,7 @@ async fn main() {
         settlement_delay_seconds = config.settlement_delay.as_secs(),
         synthesized_confirmations = config.synthesized_confirmations,
         allowed_assets = ?config.allowed_assets,
+        buyer_return_origins = config.buyer_return_origins.len(),
         "starting pubky-fiat-verifier"
     );
 

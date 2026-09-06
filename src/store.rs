@@ -44,6 +44,10 @@ pub struct Correlation {
     pub session_id: Option<String>,
     pub checkout_url: Option<String>,
     pub checkout_expires_at: Option<i64>,
+    /// Buyer return origin the session's redirect URLs were derived from
+    /// (`None` = the static fallback URLs). Bound when the session is minted
+    /// and never rebound, so a later callback or re-fetch cannot change it.
+    pub return_origin: Option<String>,
     pub session_attempt: i32,
     /// Populated on the first verified-paid pull; the reversal path resolves
     /// charges back to correlations through it (SQL lookup in production).
@@ -91,6 +95,7 @@ pub trait CorrelationStore: Send + Sync {
         checkout_url: &str,
         checkout_expires_at: i64,
         session_attempt: i32,
+        return_origin: Option<&str>,
     ) -> Result<(), StoreError>;
     /// Records a verified-paid observation (from the API pull, never from a
     /// webhook body). Forward-only: no-op unless current state is `created`.
@@ -149,6 +154,7 @@ CREATE TABLE IF NOT EXISTS correlations (
     session_id TEXT,
     checkout_url TEXT,
     checkout_expires_at BIGINT,
+    return_origin TEXT,
     session_attempt INTEGER NOT NULL DEFAULT 0,
     payment_intent TEXT,
     amount_matched BOOLEAN NOT NULL DEFAULT FALSE,
@@ -159,6 +165,7 @@ CREATE TABLE IF NOT EXISTS correlations (
     PRIMARY KEY (creator, bundle_id)
 );
 ALTER TABLE correlations ADD COLUMN IF NOT EXISTS processor TEXT;
+ALTER TABLE correlations ADD COLUMN IF NOT EXISTS return_origin TEXT;
 CREATE INDEX IF NOT EXISTS correlations_payment_intent_idx
     ON correlations (payment_intent) WHERE payment_intent IS NOT NULL;
 CREATE INDEX IF NOT EXISTS correlations_open_idx
@@ -201,6 +208,7 @@ fn row_to_correlation(row: sqlx::postgres::PgRow) -> Result<Correlation, StoreEr
         session_id: row.try_get("session_id").map_err(db_err)?,
         checkout_url: row.try_get("checkout_url").map_err(db_err)?,
         checkout_expires_at: row.try_get("checkout_expires_at").map_err(db_err)?,
+        return_origin: row.try_get("return_origin").map_err(db_err)?,
         session_attempt: row.try_get("session_attempt").map_err(db_err)?,
         payment_intent: row.try_get("payment_intent").map_err(db_err)?,
         amount_matched: row.try_get("amount_matched").map_err(db_err)?,
@@ -213,8 +221,8 @@ fn db_err(error: sqlx::Error) -> StoreError {
 }
 
 const SELECT_COLUMNS: &str = "creator, bundle_id, lock_resource, reader, asset, amount_minor, \
-     state, processor, session_id, checkout_url, checkout_expires_at, session_attempt, \
-     payment_intent, amount_matched, paid_at";
+     state, processor, session_id, checkout_url, checkout_expires_at, return_origin, \
+     session_attempt, payment_intent, amount_matched, paid_at";
 
 #[async_trait]
 impl CorrelationStore for PostgresStore {
@@ -271,10 +279,12 @@ impl CorrelationStore for PostgresStore {
         checkout_url: &str,
         checkout_expires_at: i64,
         session_attempt: i32,
+        return_origin: Option<&str>,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE correlations SET processor = $3, session_id = $4, checkout_url = $5, \
-             checkout_expires_at = $6, session_attempt = $7, updated_at = now() \
+             checkout_expires_at = $6, session_attempt = $7, \
+             return_origin = COALESCE($8, return_origin), updated_at = now() \
              WHERE creator = $1 AND bundle_id = $2",
         )
         .bind(creator)
@@ -284,6 +294,7 @@ impl CorrelationStore for PostgresStore {
         .bind(checkout_url)
         .bind(checkout_expires_at)
         .bind(session_attempt)
+        .bind(return_origin)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -443,6 +454,7 @@ pub mod memory {
                     session_id: None,
                     checkout_url: None,
                     checkout_expires_at: None,
+                    return_origin: None,
                     session_attempt: 0,
                     payment_intent: None,
                     amount_matched: false,
@@ -474,6 +486,7 @@ pub mod memory {
             checkout_url: &str,
             checkout_expires_at: i64,
             session_attempt: i32,
+            return_origin: Option<&str>,
         ) -> Result<(), StoreError> {
             let mut rows = self.rows.lock().unwrap();
             if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
@@ -482,6 +495,9 @@ pub mod memory {
                 row.checkout_url = Some(checkout_url.to_owned());
                 row.checkout_expires_at = Some(checkout_expires_at);
                 row.session_attempt = session_attempt;
+                if let Some(origin) = return_origin {
+                    row.return_origin = Some(origin.to_owned());
+                }
             }
             Ok(())
         }

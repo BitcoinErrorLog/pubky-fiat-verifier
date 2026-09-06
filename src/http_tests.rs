@@ -42,6 +42,9 @@ const PAYPAL_WEBHOOK_ID: &str = "WH-UNIT-TEST";
 /// Shared secret of the mock verification scheme (stands in for PayPal's
 /// cert-based transmission signature, which only PayPal can produce).
 const PAYPAL_MOCK_VERIFY_KEY: &str = "paypal_mock_transmission_key";
+/// Allowlisted buyer return origins used by the harness.
+const ORIGIN_A: &str = "https://shop.pubky.app";
+const ORIGIN_B: &str = "https://staging-shop.vercel.app";
 
 fn locks_key() -> SigningKey {
     SigningKey::from_bytes(&[9_u8; 32])
@@ -625,6 +628,7 @@ async fn build_harness(options: HarnessOptions) -> Harness {
         allowed_assets: vec!["USD".into()],
         checkout_success_url: "https://app.test/success".into(),
         checkout_cancel_url: "https://app.test/cancel".into(),
+        buyer_return_origins: vec![ORIGIN_A.into(), ORIGIN_B.into()],
         checkout_limiter: TokenBucket::new(100, 100),
     });
     let base = spawn(router(state)).await;
@@ -765,9 +769,21 @@ impl Harness {
     }
 
     async fn checkout(&self, bundle: &str, processor: Option<&str>) -> reqwest::Response {
+        self.checkout_with_origin(bundle, processor, None).await
+    }
+
+    async fn checkout_with_origin(
+        &self,
+        bundle: &str,
+        processor: Option<&str>,
+        return_origin: Option<&str>,
+    ) -> reqwest::Response {
         let mut body = json!({"creator": CREATOR, "bundle_id": bundle});
         if let Some(processor) = processor {
             body["processor"] = json!(processor);
+        }
+        if let Some(origin) = return_origin {
+            body["return_origin"] = json!(origin);
         }
         self.http
             .post(format!("{}/checkout-sessions", self.base))
@@ -1066,6 +1082,7 @@ async fn checkout_sessions_returns_url_and_reminting_only_after_expiry() {
             first["checkout_url"].as_str().unwrap(),
             1,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1583,6 +1600,7 @@ async fn paypal_checkout_remints_on_the_same_processor_after_expiry() {
             first["checkout_url"].as_str().unwrap(),
             1,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1611,4 +1629,161 @@ async fn paypal_health_reports_processor_flags() {
     assert_eq!(health["paypal_enabled"], true);
     assert_eq!(health["paypal_webhook_configured"], true);
     assert_eq!(health["default_processor"], "paypal");
+}
+
+// -- buyer return origins -----------------------------------------------------
+
+#[tokio::test]
+async fn stripe_checkout_with_allowlisted_origin_derives_return_urls() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let checkout = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await;
+    assert_eq!(checkout.status().as_u16(), 200);
+
+    // Stripe received the server-side derived URLs (form-encoded).
+    // [0] is the eager fallback mint at invoice time.
+    let form = harness.stripe_mock.creates.lock().unwrap()[1].1.clone();
+    assert!(
+        form.contains("success_url=https%3A%2F%2Fshop.pubky.app%2Fmarketplace%3Fcheckout%3Dreturn"),
+        "form was: {form}"
+    );
+    assert!(
+        form.contains("cancel_url=https%3A%2F%2Fshop.pubky.app%2Fmarketplace%3Fcheckout%3Dcancel"),
+        "form was: {form}"
+    );
+
+    // The origin is persisted alongside the session.
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+}
+
+#[tokio::test]
+async fn paypal_checkout_with_allowlisted_origin_derives_return_urls() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let checkout = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_B))
+        .await;
+    assert_eq!(checkout.status().as_u16(), 200);
+
+    let creates = harness.paypal_mock.creates.lock().unwrap();
+    let (_, body) = &creates[1]; // [0] is the eager fallback mint
+    let body: Value = serde_json::from_str(body).unwrap();
+    let context = &body["payment_source"]["paypal"]["experience_context"];
+    assert_eq!(
+        context["return_url"],
+        format!("{ORIGIN_B}/marketplace?checkout=return")
+    );
+    assert_eq!(
+        context["cancel_url"],
+        format!("{ORIGIN_B}/marketplace?checkout=cancel")
+    );
+}
+
+#[tokio::test]
+async fn checkout_rejects_origins_off_the_allowlist() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    for origin in [
+        "https://unknown-shop.example.com", // unknown origin
+        "https://shop.pubky.app.evil.com",  // lookalike host
+        "http://shop.pubky.app",            // not https
+        "https://shop.pubky.app/marketplace?checkout=return", // full URL, not an origin
+        "https://shop.pubky.app/",          // trailing slash is not exact
+    ] {
+        let response = harness
+            .checkout_with_origin(BUNDLE, None, Some(origin))
+            .await;
+        assert_eq!(response.status().as_u16(), 400, "origin: {origin}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_return_origin");
+    }
+    // Nothing was minted or bound by the rejected requests.
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 1);
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin, None);
+}
+
+#[tokio::test]
+async fn checkout_without_origin_uses_the_static_fallback_urls() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+    let checkout = harness.checkout(BUNDLE, None).await;
+    assert_eq!(checkout.status().as_u16(), 200);
+
+    let creates = harness.stripe_mock.creates.lock().unwrap();
+    assert_eq!(creates.len(), 1); // the eager mint, no re-mint
+    let (_, form) = &creates[0];
+    assert!(form.contains("success_url=https%3A%2F%2Fapp.test%2Fsuccess"));
+    assert!(form.contains("cancel_url=https%3A%2F%2Fapp.test%2Fcancel"));
+}
+
+#[tokio::test]
+async fn bound_origin_is_persistent_and_immutable() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    // Bind ORIGIN_A.
+    let first: Value = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+
+    // A different origin conflicts; the same origin returns the live session.
+    let switched = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_B))
+        .await;
+    assert_eq!(switched.status().as_u16(), 409);
+    let repeat: Value = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeat["checkout_url"], first["checkout_url"]);
+
+    // Force expiry, then re-fetch WITHOUT an origin: the re-mint keeps the
+    // bound origin — a later request can never change it back.
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "stripe",
+            "cs_test_2",
+            first["checkout_url"].as_str().unwrap(),
+            1,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+    let reminted: Value = harness.checkout(BUNDLE, None).await.json().await.unwrap();
+    assert_eq!(
+        reminted["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_3"
+    );
+    let form = harness
+        .stripe_mock
+        .creates
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .clone();
+    assert!(
+        form.contains("success_url=https%3A%2F%2Fshop.pubky.app%2Fmarketplace%3Fcheckout%3Dreturn"),
+        "form was: {form}"
+    );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
 }

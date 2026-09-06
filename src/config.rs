@@ -74,8 +74,15 @@ pub struct Config {
     pub poll_interval: Duration,
     /// Criterion assets accepted on the fiat path (uppercase ISO 4217).
     pub allowed_assets: Vec<String>,
+    /// Legacy single-shop redirect targets, used for checkout requests that
+    /// carry no `return_origin`.
     pub checkout_success_url: String,
     pub checkout_cancel_url: String,
+    /// Exact `https://` origins (`BUYER_RETURN_ORIGINS`, comma-separated) a
+    /// buyer checkout request may name as its return origin. Canonical
+    /// `url::Url` origin serializations; matching is string equality. Empty
+    /// disables per-request origins (single-shop fallback mode).
+    pub buyer_return_origins: Vec<String>,
     /// Max content-lock document size fetched from a homeserver.
     pub lock_resource_max_bytes: u64,
     pub lock_fetch_timeout: Duration,
@@ -220,6 +227,9 @@ impl Config {
         let checkout_cancel_url = std::env::var("FIAT_CHECKOUT_CANCEL_URL")
             .unwrap_or_else(|_| "https://staging.pubky.app/marketplace?checkout=cancel".to_owned());
 
+        let buyer_return_origins =
+            parse_origin_list(&std::env::var("BUYER_RETURN_ORIGINS").unwrap_or_default())?;
+
         Ok(Self {
             bind_addr,
             trusted_locks_public_key,
@@ -234,6 +244,7 @@ impl Config {
             allowed_assets,
             checkout_success_url,
             checkout_cancel_url,
+            buyer_return_origins,
             lock_resource_max_bytes: parse_u64("FIAT_LOCK_RESOURCE_MAX_BYTES", 10_000_000)?,
             lock_fetch_timeout: Duration::from_secs(parse_u64(
                 "FIAT_LOCK_FETCH_TIMEOUT_SECONDS",
@@ -261,6 +272,45 @@ pub fn parse_trusted_key(value: &str) -> Result<VerifyingKey, ConfigError> {
         .map_err(|error| ConfigError::Invalid("FIAT_TRUSTED_LOCKS_PUBLIC_KEY", error.to_string()))
 }
 
+/// Parses one exact buyer return origin: `https://host[:port]` and nothing
+/// else — no path, query, fragment, or userinfo, no trailing slash, no
+/// default-port or case spelling that the parse would normalize away (the
+/// same strictness as the Lock Server's origin allowlists). Returns the
+/// canonical `url::Url` origin serialization, which doubles as the allowlist
+/// comparison key: matching is string equality after parse-and-reserialize.
+pub fn parse_return_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    (origin == value).then_some(origin)
+}
+
+/// Parses the `BUYER_RETURN_ORIGINS` comma-separated allowlist; any invalid
+/// entry fails startup.
+fn parse_origin_list(value: &str) -> Result<Vec<String>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            parse_return_origin(entry).ok_or_else(|| {
+                ConfigError::Invalid(
+                    "BUYER_RETURN_ORIGINS",
+                    format!("'{entry}' is not an exact https:// origin (scheme+host[+port] only)"),
+                )
+            })
+        })
+        .collect()
+}
+
 fn required(name: &'static str) -> Result<String, ConfigError> {
     std::env::var(name)
         .ok()
@@ -276,5 +326,63 @@ fn parse_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
             .parse::<u64>()
             .map_err(|error| ConfigError::Invalid(name, error.to_string())),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_list_accepts_exact_https_origins() {
+        let origins = parse_origin_list(
+            "https://shop.pubky.app, https://pubky-marketplace-staging.vercel.app , https://shop.example.com:8443",
+        )
+        .unwrap();
+        assert_eq!(
+            origins,
+            vec![
+                "https://shop.pubky.app",
+                "https://pubky-marketplace-staging.vercel.app",
+                "https://shop.example.com:8443",
+            ]
+        );
+        // Empty list (unset var) is allowed: single-shop fallback mode.
+        assert_eq!(parse_origin_list("").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn origin_list_rejects_invalid_entries() {
+        for entry in [
+            "http://shop.pubky.app",              // not https
+            "https://shop.pubky.app/",            // trailing slash
+            "https://shop.pubky.app/marketplace", // path
+            "https://shop.pubky.app?x=1",         // query
+            "https://shop.pubky.app#frag",        // fragment
+            "https://user@shop.pubky.app",        // userinfo
+            "https://shop.pubky.app:443",         // normalized default port
+            "HTTPS://shop.pubky.app",             // normalized scheme case
+            "shop.pubky.app",                     // no scheme
+            "not a url",
+        ] {
+            assert!(
+                parse_origin_list(entry).is_err(),
+                "entry should be rejected: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_return_origin_is_the_canonical_comparison_key() {
+        assert_eq!(
+            parse_return_origin("https://shop.pubky.app").as_deref(),
+            Some("https://shop.pubky.app")
+        );
+        // A lookalike parses as a valid origin of its own; allowlist
+        // membership (string equality) is what rejects it.
+        assert_eq!(
+            parse_return_origin("https://shop.pubky.app.evil.com").as_deref(),
+            Some("https://shop.pubky.app.evil.com")
+        );
     }
 }

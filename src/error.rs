@@ -17,6 +17,9 @@ pub enum ApiError {
     NotFound,
     LockNotFound,
     InvoiceConflict,
+    /// `return_origin` is not an exact `https://` origin on the deployment's
+    /// `BUYER_RETURN_ORIGINS` allowlist.
+    InvalidReturnOrigin,
     /// Fiat processing unavailable (no processor configured, processor down,
     /// or persistence failure). Non-409 invoice failures fail the proof-bundle
     /// submission upstream, which is the designed fail-closed behavior.
@@ -66,6 +69,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 "invoice_conflict",
                 "invoice binding conflicts with an existing invoice",
+            ),
+            Self::InvalidReturnOrigin => (
+                StatusCode::BAD_REQUEST,
+                "invalid_return_origin",
+                "return_origin is not an allowlisted buyer return origin",
             ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,

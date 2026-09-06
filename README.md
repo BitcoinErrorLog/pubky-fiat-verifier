@@ -55,7 +55,7 @@ not a second backend: one URL, all rails. Cutover is an operator env change
 | --- | --- | --- |
 | `POST /invoices` | `X-Paykit-Signature` (pinned Lock Server key; canonical-JSON strict body) | Fetch the content lock from the creator's homeserver (public Pubky read), parse the `paykit-payment` criterion, dispatch by `asset`. BTC → proxy. Fiat → persist correlation, `204`; a hosted checkout is minted eagerly when exactly one processor is configured (see processor selection below). Exact replay → `204` (idempotent). Same identity, different binding → `409`. |
 | `POST /transactions/status` | same | Unknown or BTC correlation → proxy (the real Paykit Server owns every BTC invoice, including all pre-cutover ones). Fiat → answered from local state, advanced **only** by verified API pulls. |
-| `POST /checkout-sessions` | possession of `{creator, bundle_id}` (bearer material), rate-limited | Body `{creator, bundle_id, processor?}`. Returns `{checkout_url, processor, expires_at}`. Idempotent; re-mints on the **same** processor if the session expired. `404` unknown/BTC, `409` once paid or when `processor` names a different processor than the correlation is bound to, `400` unknown processor value, `503` when the named processor is not configured. |
+| `POST /checkout-sessions` | possession of `{creator, bundle_id}` (bearer material), rate-limited | Body `{creator, bundle_id, processor?, return_origin?}`. Returns `{checkout_url, processor, expires_at}`. Idempotent; re-mints on the **same** processor if the session expired. `404` unknown/BTC, `409` once paid, when `processor` names a different processor than the correlation is bound to, or when `return_origin` differs from the bound origin, `400` unknown processor value (`invalid_request`) or an origin off the allowlist (`invalid_return_origin`), `503` when the named processor is not configured. |
 | `POST /webhooks/stripe` | `Stripe-Signature` (HMAC over raw body, ±300s tolerance, deduped by event id) | A **hint, never a fact**: schedules an API pull. `checkout.session.completed` / `async_payment_succeeded` → pull the session. `charge.refunded` / `charge.dispute.created` → pull the charge, and only a corroborating pull marks the correlation reversed. |
 | `POST /webhooks/paypal` | PayPal transmission headers, verified via `POST /v1/notifications/verify-webhook-signature` over the exact raw body (requires `PAYPAL_WEBHOOK_ID`); deduped by event id | Same hint-only rule. `CHECKOUT.ORDER.APPROVED` / `CHECKOUT.ORDER.COMPLETED` / `PAYMENT.CAPTURE.COMPLETED` / `PENDING` → pull the order. `PAYMENT.CAPTURE.REFUNDED` / `REVERSED` / `DENIED` → pull the capture; `CUSTOMER.DISPUTE.CREATED` → pull the dispute; only a corroborating pull marks the correlation reversed. |
 | `GET /health` | none | DB + processor wiring status (`stripe_enabled`, `stripe_webhook_configured`, `paypal_enabled`, `paypal_webhook_configured`, `default_processor`). |
@@ -142,7 +142,8 @@ All configuration is environment variables. No secret ever lives in this repo.
 | `FIAT_SETTLEMENT_DELAY_SECONDS` | no | `300` | Anti-chargeback rest period between `detected` and `confirmed`. |
 | `FIAT_SYNTHESIZED_CONFIRMATIONS` | no | `1` | Reported once confirmed; must be ≥ the Lock Server's `[paykit] minimum_confirmations`. |
 | `FIAT_ALLOWED_ASSETS` | no | `USD` | Comma-separated uppercase fiat codes accepted on the fiat path (never BTC). |
-| `FIAT_CHECKOUT_SUCCESS_URL` / `FIAT_CHECKOUT_CANCEL_URL` | no | staging app URLs | Stripe Checkout redirect targets. Redirects are buyer-attested and carry no state; the Locks lifecycle is the only truth. |
+| `BUYER_RETURN_ORIGINS` | no | empty | Comma-separated exact `https://` origins (scheme+host[+port] only — no path/query/fragment/userinfo; any invalid entry refuses to boot). Multi-shop mode: a `/checkout-sessions` request may name one as `return_origin`, and the success/cancel redirect URLs are then derived server-side as `{origin}/marketplace?checkout=return` and `{origin}/marketplace?checkout=cancel`. The origin is bound to the correlation at mint and never changes. |
+| `FIAT_CHECKOUT_SUCCESS_URL` / `FIAT_CHECKOUT_CANCEL_URL` | no | staging app URLs | **Legacy single-shop mode**: static redirect targets used when a checkout request carries no `return_origin` (or the allowlist is empty). Redirects are buyer-attested and carry no state; the Locks lifecycle is the only truth. |
 | `FIAT_POLL_INTERVAL_SECONDS` | no | `60` | Slow-poll interval over open fiat correlations (lost-webhook recovery). |
 | `FIAT_CHECKOUT_RATE_PER_SECOND` / `FIAT_CHECKOUT_RATE_BURST` | no | `5` / `20` | Token bucket for `/checkout-sessions`. |
 | `STRIPE_API_BASE` | no | `https://api.stripe.com` | Overridable for tests only. |
@@ -231,10 +232,11 @@ state except a pull: grep for those two messages when auditing an entitlement.
 ## Development
 
 ```bash
-cargo test        # 72 tests: signature verification, dispatch, idempotency,
+cargo test        # 80 tests: signature verification, dispatch, idempotency,
                   # webhook-vs-pull disagreement (pull wins), delay window,
                   # re-mint, reversal suppression, processor selection and
-                  # binding, PayPal lifecycle + capture-on-approval
+                  # binding, PayPal lifecycle + capture-on-approval, buyer
+                  # return-origin allowlist + binding
 cargo build --release
 ```
 

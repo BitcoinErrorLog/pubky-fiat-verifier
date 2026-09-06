@@ -50,6 +50,15 @@ pub struct CheckoutSessionRequest {
     /// mismatch is a 409. Defaults to the deployment's default processor.
     #[serde(default)]
     pub processor: Option<String>,
+    /// Optional buyer return origin (bare `https://host[:port]`, never a full
+    /// URL). Must exact-match the deployment's `BUYER_RETURN_ORIGINS`
+    /// allowlist or the request is a 400 `invalid_return_origin`. When
+    /// accepted, the success/cancel redirect URLs are derived server-side
+    /// (`{origin}/marketplace?checkout=return|cancel`) and the origin is
+    /// bound to the correlation permanently: a later request naming a
+    /// different origin is a 409.
+    #[serde(default)]
+    pub return_origin: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

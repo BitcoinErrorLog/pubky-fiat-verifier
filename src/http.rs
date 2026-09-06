@@ -64,8 +64,13 @@ pub struct AppState {
     pub settlement_delay: Duration,
     pub synthesized_confirmations: u32,
     pub allowed_assets: Vec<String>,
+    /// Static fallback redirect targets (legacy single-shop mode), used when
+    /// no return origin is bound to the correlation.
     pub checkout_success_url: String,
     pub checkout_cancel_url: String,
+    /// Exact `https://` origins a checkout request may name as
+    /// `return_origin` (canonical `url::Url` serializations).
+    pub buyer_return_origins: Vec<String>,
     pub checkout_limiter: TokenBucket,
 }
 
@@ -223,6 +228,7 @@ async fn create_invoice(
                 &criterion.asset,
                 amount_minor,
                 existing.session_attempt + 1,
+                None,
             )
             .await
             {
@@ -249,6 +255,7 @@ async fn create_invoice(
                 &criterion.asset,
                 amount_minor,
                 1,
+                None,
             )
             .await
             {
@@ -269,6 +276,23 @@ async fn create_invoice(
     }
 }
 
+/// The redirect targets a session is minted with: derived server-side from
+/// the bound buyer return origin, or the static fallback URLs (legacy
+/// single-shop mode) when no origin is bound.
+fn return_urls(state: &AppState, return_origin: Option<&str>) -> (String, String) {
+    match return_origin {
+        Some(origin) => (
+            format!("{origin}/marketplace?checkout=return"),
+            format!("{origin}/marketplace?checkout=cancel"),
+        ),
+        None => (
+            state.checkout_success_url.clone(),
+            state.checkout_cancel_url.clone(),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn mint_session(
     state: &Arc<AppState>,
     kind: ProcessorKind,
@@ -277,6 +301,7 @@ async fn mint_session(
     asset: &str,
     amount_minor: i64,
     attempt: i32,
+    return_origin: Option<&str>,
 ) -> Result<CheckoutSessionResponse, Response> {
     match kind {
         ProcessorKind::Stripe => {
@@ -291,6 +316,7 @@ async fn mint_session(
                 asset,
                 amount_minor,
                 attempt,
+                return_origin,
             )
             .await
         }
@@ -298,6 +324,7 @@ async fn mint_session(
             let Some(paypal) = state.processors.paypal.as_ref() else {
                 return Err(ApiError::Unavailable.into_response());
             };
+            let (success_url, cancel_url) = return_urls(state, return_origin);
             let order = paypal
                 .create_order(
                     &client_reference(creator, bundle_id),
@@ -305,8 +332,8 @@ async fn mint_session(
                     amount_minor,
                     asset,
                     "Marketplace listing (Locks entitlement)",
-                    &state.checkout_success_url,
-                    &state.checkout_cancel_url,
+                    &success_url,
+                    &cancel_url,
                 )
                 .await
                 .map_err(|error| {
@@ -328,6 +355,7 @@ async fn mint_session(
                     &approval_url,
                     expires_at,
                     attempt,
+                    return_origin,
                 )
                 .await
                 .map_err(|error| {
@@ -343,6 +371,7 @@ async fn mint_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mint_stripe_session(
     state: &Arc<AppState>,
     stripe: &Arc<StripeProcessor>,
@@ -351,7 +380,9 @@ async fn mint_stripe_session(
     asset: &str,
     amount_minor: i64,
     attempt: i32,
+    return_origin: Option<&str>,
 ) -> Result<CheckoutSessionResponse, Response> {
+    let (success_url, cancel_url) = return_urls(state, return_origin);
     let session = stripe
         .create_checkout_session(
             &client_reference(creator, bundle_id),
@@ -359,8 +390,8 @@ async fn mint_stripe_session(
             amount_minor,
             &asset.to_ascii_lowercase(),
             "Marketplace listing (Locks entitlement)",
-            &state.checkout_success_url,
-            &state.checkout_cancel_url,
+            &success_url,
+            &cancel_url,
         )
         .await
         .map_err(|error| {
@@ -382,6 +413,7 @@ async fn mint_stripe_session(
             &checkout_url,
             expires_at,
             attempt,
+            return_origin,
         )
         .await
         .map_err(|error| {
@@ -505,6 +537,23 @@ async fn checkout_session(
             None => return ApiError::InvalidRequest.into_response(),
         },
     };
+    // A return origin is accepted only as an exact allowlisted `https://`
+    // origin (string equality after url parse-and-reserialize) — never a
+    // full URL, so this cannot become an open redirect.
+    let requested_origin = match request.return_origin.as_deref() {
+        None => None,
+        Some(value) => match crate::config::parse_return_origin(value) {
+            Some(origin)
+                if state
+                    .buyer_return_origins
+                    .iter()
+                    .any(|allowed| allowed == &origin) =>
+            {
+                Some(origin)
+            }
+            _ => return ApiError::InvalidReturnOrigin.into_response(),
+        },
+    };
     if !state.processors.any_configured() {
         return ApiError::Unavailable.into_response();
     }
@@ -522,6 +571,16 @@ async fn checkout_session(
         // a fresh proof bundle.
         return ApiError::InvoiceConflict.into_response();
     }
+    // The return-origin binding is permanent, exactly like the processor
+    // binding: a different origin than the bound one conflicts, and a
+    // re-fetch without an origin keeps the bound one (never reverts to the
+    // fallback, never follows a later request).
+    if let (Some(bound), Some(requested)) = (&correlation.return_origin, &requested_origin) {
+        if bound != requested {
+            return ApiError::InvoiceConflict.into_response();
+        }
+    }
+    let origin = correlation.return_origin.clone().or(requested_origin);
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
     let kind = match bound_processor(&correlation) {
         Some(bound) => {
@@ -531,17 +590,22 @@ async fn checkout_session(
             if requested.is_some_and(|requested| requested != bound) {
                 return ApiError::InvoiceConflict.into_response();
             }
-            if let (Some(url), Some(expires_at)) = (
-                correlation.checkout_url.clone(),
-                correlation.checkout_expires_at,
-            ) {
-                if expires_at > now_unix + SESSION_EXPIRY_SLACK_SECONDS {
-                    return Json(CheckoutSessionResponse {
-                        checkout_url: url,
-                        processor: bound.as_str(),
-                        expires_at,
-                    })
-                    .into_response();
+            // The live session is reused only when it was minted with the
+            // effective origin; a newly named origin re-mints so the
+            // processor-side redirect URLs really derive from it.
+            if correlation.return_origin == origin {
+                if let (Some(url), Some(expires_at)) = (
+                    correlation.checkout_url.clone(),
+                    correlation.checkout_expires_at,
+                ) {
+                    if expires_at > now_unix + SESSION_EXPIRY_SLACK_SECONDS {
+                        return Json(CheckoutSessionResponse {
+                            checkout_url: url,
+                            processor: bound.as_str(),
+                            expires_at,
+                        })
+                        .into_response();
+                    }
                 }
             }
             bound
@@ -551,7 +615,8 @@ async fn checkout_session(
     if !state.processors.is_configured(kind) {
         return ApiError::Unavailable.into_response();
     }
-    // Session expired (or was never minted / never fully persisted): mint.
+    // Session expired (or was never minted / never fully persisted), or a
+    // return origin is being bound for the first time: mint.
     match mint_session(
         &state,
         kind,
@@ -560,6 +625,7 @@ async fn checkout_session(
         &correlation.asset,
         correlation.amount_minor,
         correlation.session_attempt + 1,
+        origin.as_deref(),
     )
     .await
     {

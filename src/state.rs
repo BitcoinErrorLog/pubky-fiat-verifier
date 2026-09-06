@@ -82,6 +82,7 @@ mod tests {
             session_id: Some("cs_test_1".into()),
             checkout_url: Some("https://checkout.stripe.com/c/pay/x".into()),
             checkout_expires_at: None,
+            return_origin: None,
             session_attempt: 1,
             payment_intent: None,
             amount_matched: matches!(state, CorrelationState::Paid | CorrelationState::Confirmed),
