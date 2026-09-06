@@ -345,7 +345,7 @@ async fn mint_session(
                 ApiError::Unavailable.into_response()
             })?;
             let expires_at = OffsetDateTime::now_utc().unix_timestamp() + PAYPAL_ORDER_TTL_SECONDS;
-            state
+            let persisted = state
                 .store
                 .set_session(
                     creator,
@@ -362,6 +362,9 @@ async fn mint_session(
                     tracing::error!(%error, "failed to persist paypal order");
                     ApiError::Unavailable.into_response()
                 })?;
+            if !persisted {
+                return persisted_session_after_lost_race(state, creator, bundle_id).await;
+            }
             Ok(CheckoutSessionResponse {
                 checkout_url: approval_url,
                 processor: ProcessorKind::Paypal.as_str(),
@@ -403,7 +406,7 @@ async fn mint_stripe_session(
         ApiError::Unavailable.into_response()
     })?;
     let expires_at = session.expires_at.unwrap_or(0);
-    state
+    let persisted = state
         .store
         .set_session(
             creator,
@@ -420,11 +423,56 @@ async fn mint_stripe_session(
             tracing::error!(%error, "failed to persist checkout session");
             ApiError::Unavailable.into_response()
         })?;
+    if !persisted {
+        return persisted_session_after_lost_race(state, creator, bundle_id).await;
+    }
     Ok(CheckoutSessionResponse {
         checkout_url,
         processor: ProcessorKind::Stripe.as_str(),
         expires_at,
     })
+}
+
+/// The conditional persist of a just-minted session lost the race: between
+/// the pre-mint read and the UPDATE, a concurrent mint bound the correlation
+/// to a different return origin. The session we minted derives its redirect
+/// URLs from an origin the correlation is NOT bound to, so it is never
+/// served — re-read the winner instead. Choice (a) over (b): when the
+/// winning session is still live it is served, because the store guard
+/// makes it impossible for that session to carry URLs derived from anything
+/// but the now-bound origin — there is nothing to conflict about. Only a
+/// missing, expired, or no-longer-created row falls through to (b), a 409
+/// `invoice_conflict`.
+async fn persisted_session_after_lost_race(
+    state: &Arc<AppState>,
+    creator: &str,
+    bundle_id: &str,
+) -> Result<CheckoutSessionResponse, Response> {
+    let correlation = match state.store.get(creator, bundle_id).await {
+        Ok(Some(correlation)) => correlation,
+        Ok(None) => return Err(ApiError::InvoiceConflict.into_response()),
+        Err(error) => {
+            tracing::error!(%error, "correlation re-read failed");
+            return Err(ApiError::Unavailable.into_response());
+        }
+    };
+    let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+    if correlation.state == CorrelationState::Created {
+        if let (Some(bound), Some(url), Some(expires_at)) = (
+            bound_processor(&correlation),
+            correlation.checkout_url.clone(),
+            correlation.checkout_expires_at,
+        ) {
+            if expires_at > now_unix + SESSION_EXPIRY_SLACK_SECONDS {
+                return Ok(CheckoutSessionResponse {
+                    checkout_url: url,
+                    processor: bound.as_str(),
+                    expires_at,
+                });
+            }
+        }
+    }
+    Err(ApiError::InvoiceConflict.into_response())
 }
 
 async fn transaction_status(

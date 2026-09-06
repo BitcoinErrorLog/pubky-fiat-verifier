@@ -82,6 +82,12 @@ struct MockStripe {
     sessions: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     charges: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     counter: Arc<Mutex<u32>>,
+    /// Incremented when a create call ARRIVES (before any gate), so tests
+    /// can wait for an in-flight mint without sleeps.
+    create_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// One-shot gate: when armed, the next create call blocks until the
+    /// test releases it (deterministic race windows, no sleeps).
+    create_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 impl MockStripe {
@@ -101,6 +107,12 @@ async fn mock_create_session(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    mock.create_calls
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let gate = mock.create_gate.lock().unwrap().take();
+    if let Some(gate) = gate {
+        let _ = gate.await;
+    }
     let idempotency = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -205,6 +217,11 @@ struct MockPaypal {
     disputes: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     capture_calls: Arc<Mutex<u32>>,
     counter: Arc<Mutex<u32>>,
+    /// Incremented when a create-order call ARRIVES (before any gate).
+    create_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// One-shot gate: when armed, the next create-order call blocks until
+    /// the test releases it (deterministic race windows, no sleeps).
+    create_gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 impl MockPaypal {
@@ -277,6 +294,12 @@ async fn mock_paypal_create_order(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    mock.create_calls
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let gate = mock.create_gate.lock().unwrap().take();
+    if let Some(gate) = gate {
+        let _ = gate.await;
+    }
     let request_id = headers
         .get("paypal-request-id")
         .and_then(|value| value.to_str().ok())
@@ -1751,7 +1774,9 @@ async fn bound_origin_is_persistent_and_immutable() {
     assert_eq!(repeat["checkout_url"], first["checkout_url"]);
 
     // Force expiry, then re-fetch WITHOUT an origin: the re-mint keeps the
-    // bound origin — a later request can never change it back.
+    // bound origin — a later request can never change it back. (The direct
+    // write must name the bound origin: the conditional persist rejects an
+    // origin-less write over an origin-bound row.)
     harness
         .store
         .set_session(
@@ -1762,7 +1787,7 @@ async fn bound_origin_is_persistent_and_immutable() {
             first["checkout_url"].as_str().unwrap(),
             1,
             2,
-            None,
+            Some(ORIGIN_A),
         )
         .await
         .unwrap();
@@ -1784,6 +1809,327 @@ async fn bound_origin_is_persistent_and_immutable() {
         form.contains("success_url=https%3A%2F%2Fshop.pubky.app%2Fmarketplace%3Fcheckout%3Dreturn"),
         "form was: {form}"
     );
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+}
+
+/// Polls until `expected` create calls have ARRIVED at the mock (they may
+/// still be parked on the one-shot gate) — no fixed sleeps in race tests.
+async fn wait_for_create_calls(calls: &std::sync::atomic::AtomicUsize, expected: usize) {
+    for _ in 0..1000 {
+        if calls.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("timed out waiting for {expected} create calls");
+}
+
+/// Fires a bare (no processor, no origin) checkout request in the
+/// background: the race loser in the concurrent-binding tests below.
+fn spawn_plain_checkout(base: &str) -> tokio::task::JoinHandle<reqwest::Response> {
+    let url = format!("{base}/checkout-sessions");
+    tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .json(&json!({"creator": CREATOR, "bundle_id": BUNDLE}))
+            .send()
+            .await
+            .unwrap()
+    })
+}
+
+// F1 regression: a no-origin mint that read the row before a concurrent
+// origin-A mint persisted must never clobber the A binding with its
+// static-fallback session. The gate parks the no-origin mint inside the
+// mock create, guaranteeing the audit's interleaving: loser read +
+// mint in flight -> winner mints and persists (binds A) -> loser's
+// fallback-URL mint persists last and is rejected by the conditional
+// UPDATE, so the loser is served the bound A session instead.
+#[tokio::test]
+async fn stripe_concurrent_fallback_mint_cannot_clobber_an_origin_binding() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    // Force expiry so both racers decide to mint (row still origin-less).
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert!(
+        harness
+            .store
+            .set_session(
+                CREATOR,
+                BUNDLE,
+                "stripe",
+                row.session_id.as_deref().unwrap(),
+                row.checkout_url.as_deref().unwrap(),
+                1,
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+        "origin-less write onto an unbound row must apply"
+    );
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let loser = spawn_plain_checkout(&harness.base);
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 2).await;
+
+    // Bump the stored attempt so the winner's mint carries a distinct
+    // idempotency key — with identical keys Stripe would replay one create
+    // onto the other, collapsing the two mints into one session and hiding
+    // the exact persist race under test.
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "stripe",
+            row.session_id.as_deref().unwrap(),
+            row.checkout_url.as_deref().unwrap(),
+            1,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The winner mints with ORIGIN_A and persists first, binding A.
+    let winner: Value = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        winner["checkout_url"],
+        "https://checkout.stripe.test/c/pay/cs_test_2"
+    );
+    let winner_form = harness.stripe_mock.creates.lock().unwrap()[1].1.clone();
+    assert!(
+        winner_form
+            .contains("success_url=https%3A%2F%2Fshop.pubky.app%2Fmarketplace%3Fcheckout%3Dreturn"),
+        "form was: {winner_form}"
+    );
+
+    // The loser's fallback-URL mint now persists last — and must lose.
+    release.send(()).unwrap();
+    let loser_response = loser.await.unwrap();
+    assert_eq!(loser_response.status().as_u16(), 200);
+    let loser_body: Value = loser_response.json().await.unwrap();
+    assert_eq!(loser_body["checkout_url"], winner["checkout_url"]);
+
+    // The loser's mint really carried the static fallback URLs — it was
+    // minted against them, yet never persisted and never served.
+    let loser_form = harness.stripe_mock.creates.lock().unwrap()[2].1.clone();
+    assert!(
+        loser_form.contains("success_url=https%3A%2F%2Fapp.test%2Fsuccess"),
+        "form was: {loser_form}"
+    );
+
+    // Invariant: return_origin=A can only ever coexist with A-derived URLs.
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+    assert_eq!(
+        row.checkout_url.as_deref(),
+        Some("https://checkout.stripe.test/c/pay/cs_test_2")
+    );
+    assert_eq!(row.session_id.as_deref(), Some("cs_test_2"));
+}
+
+// Same interleaving, but the winning session has already expired when the
+// loser re-reads: nothing valid to serve, so the loser gets (b), a 409
+// `invoice_conflict` — never its own fallback-URL session.
+#[tokio::test]
+async fn stripe_concurrent_fallback_mint_over_expired_binding_conflicts() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "stripe",
+            row.session_id.as_deref().unwrap(),
+            row.checkout_url.as_deref().unwrap(),
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.stripe_mock.create_gate.lock().unwrap() = Some(gate);
+    let loser = spawn_plain_checkout(&harness.base);
+    wait_for_create_calls(&harness.stripe_mock.create_calls, 2).await;
+
+    // Distinct idempotency key for the winner's mint (see the serve-bound
+    // race test above).
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "stripe",
+            row.session_id.as_deref().unwrap(),
+            row.checkout_url.as_deref().unwrap(),
+            1,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let winner: Value = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await
+        .json()
+        .await
+        .unwrap();
+
+    // Expire the just-bound session before the loser's persist lands.
+    assert!(
+        harness
+            .store
+            .set_session(
+                CREATOR,
+                BUNDLE,
+                "stripe",
+                "cs_test_2",
+                winner["checkout_url"].as_str().unwrap(),
+                1,
+                2,
+                Some(ORIGIN_A),
+            )
+            .await
+            .unwrap(),
+        "a write naming the bound origin must apply"
+    );
+
+    release.send(()).unwrap();
+    let loser_response = loser.await.unwrap();
+    assert_eq!(loser_response.status().as_u16(), 409);
+    let body: Value = loser_response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invoice_conflict");
+
+    // The row is untouched by the loser: still A-bound with A-derived URLs.
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+    assert_eq!(
+        row.checkout_url.as_deref(),
+        Some("https://checkout.stripe.test/c/pay/cs_test_2")
+    );
+}
+
+// Same race on the PayPal leg: the gated loser's fallback-URL order mints
+// last, loses the conditional persist, and is served the bound A order.
+#[tokio::test]
+async fn paypal_concurrent_fallback_mint_cannot_clobber_an_origin_binding() {
+    let harness = harness_paypal_only(Duration::from_secs(300)).await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "paypal",
+            row.session_id.as_deref().unwrap(),
+            row.checkout_url.as_deref().unwrap(),
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *harness.paypal_mock.create_gate.lock().unwrap() = Some(gate);
+    let loser = spawn_plain_checkout(&harness.base);
+    wait_for_create_calls(&harness.paypal_mock.create_calls, 2).await;
+
+    // Distinct idempotency key for the winner's mint (see the Stripe race
+    // test above).
+    harness
+        .store
+        .set_session(
+            CREATOR,
+            BUNDLE,
+            "paypal",
+            row.session_id.as_deref().unwrap(),
+            row.checkout_url.as_deref().unwrap(),
+            1,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let winner: Value = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        winner["checkout_url"],
+        "https://sandbox.paypal.test/checkoutnow?token=pporder_2"
+    );
+    let winner_body: Value =
+        serde_json::from_str(&harness.paypal_mock.creates.lock().unwrap()[1].1).unwrap();
+    assert_eq!(
+        winner_body["payment_source"]["paypal"]["experience_context"]["return_url"],
+        format!("{ORIGIN_A}/marketplace?checkout=return")
+    );
+
+    release.send(()).unwrap();
+    let loser_response = loser.await.unwrap();
+    assert_eq!(loser_response.status().as_u16(), 200);
+    let loser_body: Value = loser_response.json().await.unwrap();
+    assert_eq!(loser_body["checkout_url"], winner["checkout_url"]);
+
+    // The loser's minted order carried the static fallback URLs.
+    let loser_mint: Value =
+        serde_json::from_str(&harness.paypal_mock.creates.lock().unwrap()[2].1).unwrap();
+    assert_eq!(
+        loser_mint["payment_source"]["paypal"]["experience_context"]["return_url"],
+        "https://app.test/success"
+    );
+
+    let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
+    assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
+    assert_eq!(
+        row.checkout_url.as_deref(),
+        Some("https://sandbox.paypal.test/checkoutnow?token=pporder_2")
+    );
+    assert_eq!(row.session_id.as_deref(), Some("pporder_2"));
+}
+
+// Regression guard: a plain sequential no-origin re-fetch on an A-bound
+// correlation keeps returning the A session (never reverts to fallback).
+#[tokio::test]
+async fn no_origin_refetch_on_bound_correlation_returns_the_bound_session() {
+    let harness = harness().await;
+    assert_eq!(harness.invoice("usd", BUNDLE).await.status().as_u16(), 204);
+
+    let first: Value = harness
+        .checkout_with_origin(BUNDLE, None, Some(ORIGIN_A))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let refetch = harness.checkout(BUNDLE, None).await;
+    assert_eq!(refetch.status().as_u16(), 200);
+    let refetch: Value = refetch.json().await.unwrap();
+    assert_eq!(refetch["checkout_url"], first["checkout_url"]);
+
+    // No re-mint: eager + A-binding mint only.
+    assert_eq!(harness.stripe_mock.creates.lock().unwrap().len(), 2);
     let row = harness.store.get(CREATOR, BUNDLE).await.unwrap().unwrap();
     assert_eq!(row.return_origin.as_deref(), Some(ORIGIN_A));
 }

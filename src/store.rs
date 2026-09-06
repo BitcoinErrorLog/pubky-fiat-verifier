@@ -85,6 +85,17 @@ pub struct StoreError(pub String);
 pub trait CorrelationStore: Send + Sync {
     async fn insert_new(&self, new: NewCorrelation) -> Result<InsertOutcome, StoreError>;
     async fn get(&self, creator: &str, bundle_id: &str) -> Result<Option<Correlation>, StoreError>;
+    /// Persists a freshly minted session. Conditional on the origin binding:
+    /// the update applies only while the stored `return_origin` is still
+    /// unbound (NULL — first binder wins) or already equals `return_origin`
+    /// (the origin the session's redirect URLs were derived from). A mint
+    /// against the static fallback URLs (`return_origin = None`) therefore
+    /// can never overwrite an origin-bound row, and vice versa — this is
+    /// what keeps "derived from the bound origin, never rebound" atomic
+    /// across concurrent checkouts and across processes. Returns `false`
+    /// when the guard rejected the write (a concurrent mint bound a
+    /// different origin first); the caller must then not serve the session
+    /// it just minted.
     #[allow(clippy::too_many_arguments)]
     async fn set_session(
         &self,
@@ -96,7 +107,7 @@ pub trait CorrelationStore: Send + Sync {
         checkout_expires_at: i64,
         session_attempt: i32,
         return_origin: Option<&str>,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
     /// Records a verified-paid observation (from the API pull, never from a
     /// webhook body). Forward-only: no-op unless current state is `created`.
     async fn mark_paid(
@@ -280,12 +291,17 @@ impl CorrelationStore for PostgresStore {
         checkout_expires_at: i64,
         session_attempt: i32,
         return_origin: Option<&str>,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        // The origin guard: apply only while the row is unbound or bound to
+        // exactly the origin this session was minted for. With $8 NULL the
+        // second disjunct is never true, so a fallback-URL session can only
+        // persist onto a still-NULL row — never over an origin binding.
+        let updated = sqlx::query(
             "UPDATE correlations SET processor = $3, session_id = $4, checkout_url = $5, \
              checkout_expires_at = $6, session_attempt = $7, \
              return_origin = COALESCE($8, return_origin), updated_at = now() \
-             WHERE creator = $1 AND bundle_id = $2",
+             WHERE creator = $1 AND bundle_id = $2 \
+             AND (return_origin IS NULL OR return_origin = $8)",
         )
         .bind(creator)
         .bind(bundle_id)
@@ -298,7 +314,7 @@ impl CorrelationStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn mark_paid(
@@ -487,19 +503,26 @@ pub mod memory {
             checkout_expires_at: i64,
             session_attempt: i32,
             return_origin: Option<&str>,
-        ) -> Result<(), StoreError> {
+        ) -> Result<bool, StoreError> {
             let mut rows = self.rows.lock().unwrap();
-            if let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) {
-                row.processor = Some(processor.to_owned());
-                row.session_id = Some(session_id.to_owned());
-                row.checkout_url = Some(checkout_url.to_owned());
-                row.checkout_expires_at = Some(checkout_expires_at);
-                row.session_attempt = session_attempt;
-                if let Some(origin) = return_origin {
-                    row.return_origin = Some(origin.to_owned());
-                }
+            let Some(row) = rows.get_mut(&(creator.to_owned(), bundle_id.to_owned())) else {
+                return Ok(false);
+            };
+            // Same origin guard as the SQL predicate: apply only while the
+            // row is unbound or bound to exactly the minted origin. (When
+            // `return_origin` is None this reduces to `is_none()`.)
+            if row.return_origin.is_some() && row.return_origin.as_deref() != return_origin {
+                return Ok(false);
             }
-            Ok(())
+            row.processor = Some(processor.to_owned());
+            row.session_id = Some(session_id.to_owned());
+            row.checkout_url = Some(checkout_url.to_owned());
+            row.checkout_expires_at = Some(checkout_expires_at);
+            row.session_attempt = session_attempt;
+            if let Some(origin) = return_origin {
+                row.return_origin = Some(origin.to_owned());
+            }
+            Ok(true)
         }
 
         async fn mark_paid(
