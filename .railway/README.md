@@ -40,6 +40,22 @@ Apply the planned changes:
 railway config apply
 ```
 
+## Status in this repo
+
+`railway.toml` is still present and is still what Railway reads on a git deploy.
+Nothing here is live yet. Deleting `railway.toml` before running
+`railway config apply` would leave the service with no build or healthcheck
+configuration.
+
+The service name here is `fiat-verifier`, matching the live Railway service.
+`railway config migrate` suggests `pubky-fiat-verifier` after the repository
+name, which would create a second, empty service. Do not rename it.
+
+This service exists only in `pubky-marketplace-staging`; production reuses it
+over its public domain, so there is no second project to describe. The
+`preserve()` entries are load-bearing: config-as-code treats an omitted
+variable as a deletion.
+
 ## Notes
 
 - `railway config plan` is safe and does not change Railway.
