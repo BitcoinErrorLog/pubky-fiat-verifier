@@ -1,0 +1,13 @@
+{
+  "name": "pubky-fiat-verifier",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.railway.json",
+    "typecheck:railway": "tsc --noEmit -p tsconfig.railway.json"
+  },
+  "devDependencies": {
+    "railway": "3.11.0",
+    "typescript": "^5.8.3"
+  }
+}
